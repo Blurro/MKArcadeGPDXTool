@@ -1,0 +1,300 @@
+LittleEndian();
+struct Header {
+    char signature[4];               // "BIKE"
+    ushort type;
+    ushort unknown;
+
+    uint alignment;
+    uint padding;
+
+    uint materialCount;
+    uint materialArrayOffset;
+
+    uint textureMapsCount;
+    uint textureNameArrayOffset;
+
+    uint boneCount;
+    uint boneNameArrayOffset;
+    uint rootNodeArrayOffset;
+    
+    uint linkNodeCount;
+    uint linkNodeOffset;
+
+    uint totalNodeCount;
+    uint totalNodeArrayOffset;
+
+    uint padding2;
+} header;
+
+struct Material {
+    uint unknown1;
+    uint unknown2;
+    uint unknown3;
+    uint unknown4;
+    uint unknown5;
+    uint unknown6;
+
+    uint unknownValues[4];
+    float diffuse[4];    // RGBA
+    float specular[4];   // RGBA
+    float ambience[4]; // RGBA
+
+    float shiny;
+    
+    float unknown7;
+    float unknown8;
+    float unknown9;
+    float unknown10;
+    float unknown11;
+    float unknown12;
+    float unknown13;
+    float unknown14;
+    float unknown15;
+    float unknown16;
+    float unknown17;
+    float unknown18;
+    float unknown19;
+    float unknown20;
+    float unknown21;
+    float unknown22;
+    float unknown23;
+    float unknown24;
+    float unknown25;
+
+    short albedoTextureIndex;
+    short specularTextureIndex;
+    short refTextureIndex;
+    short environmentTextureIndex;
+    short normalTextureIndex;
+    short unknownTextureSlot;
+};
+
+// read all materials
+FSeek(header.materialArrayOffset);
+Material Materials[header.materialCount];
+
+// cool structs that get name of thing and pointer under it
+typedef struct {
+    uint pointer;
+} cstring<read=ReadCString>;
+string ReadCString(cstring& str) {
+    if (str.pointer > 0) return ReadString(str.pointer);
+    return "(null)";
+}
+
+
+// now jump to texture name array
+FSeek(header.textureNameArrayOffset);
+cstring TextureNames[header.textureMapsCount];
+
+
+// now jump to bone name array
+typedef struct
+{
+    cstring Name;
+    uint DataOffset;
+} Boneys;
+
+FSeek(header.boneNameArrayOffset);
+Boneys BoneNames[header.boneCount];
+
+FSeek(header.rootNodeArrayOffset);
+uint FirstRootNodeDataOffset;
+
+typedef struct {
+    uint meshDataOffset;
+    uint boneDataOffset;
+    uint Number;
+} Linkeys;
+
+// now jump to node links array
+if (header.linkNodeOffset > 0) {
+    FSeek(header.linkNodeOffset);
+    Linkeys Links[header.linkNodeCount] <optimize=false>;
+}
+
+typedef struct
+{
+    cstring Name;
+    uint DataOffset;
+} TotalNodeys;
+
+FSeek(header.totalNodeArrayOffset);
+TotalNodeys AllNodeNames[header.totalNodeCount];
+
+typedef struct {
+    uint visibility;
+    float scale[3];
+    float rotation[3];
+    float translation[3];
+    float boundingBox[4];
+    uint modelObjectArrayOffset;
+    uint childrenArrayOffset;
+    float morefloats[3];
+    float unknowns2[12];
+} BoneyData;
+
+struct BoneMask
+{
+    ubyte    _b8   <name="BitsFlipped",read=ReadBinary,write=WriteBinary>;
+    ubyte    _b8   <name="BitsFlipped",read=ReadBinary,write=WriteBinary>;
+    ubyte    _b8   <name="BitsFlipped",read=ReadBinary,write=WriteBinary>;
+    ubyte    _b8   <name="BitsFlipped",read=ReadBinary,write=WriteBinary>;
+};
+string ReadBinary( ubyte b )             { return IntToBinaryStr(b); }
+
+struct ModelObject
+{
+    uint32 pad_00;              // 0x00
+    uint32 triangleCount;           // 0x04 (index buffer count = triangleCount * 3)
+    uint32 materialIndex;           // 0x08
+    float boundingBox[4];
+    uint32 vertexCount;            // 0x1C
+    uint32 posBufferOffset;        // 0x20
+    uint32 normalBufferOffset;     // 0x24
+    uint32 colorBufferOffset;      // 0x28
+    uint32 uvBufferOffset;         // 0x2C
+    uint32 uv2BufferOffset;    // 0x30
+    uint32 uv3BufferOffset;             // 0x34
+    uint32 uv4BufferOffset;             // 0x38
+    uint32 indexBufferOffset;      // 0x3C
+    uint SkinnedBonesCount;
+    BoneMask BoneIndexMask;
+    uint WeightOffset;
+    float boundingBoxMinMax[6];
+};
+local uint VertexCount;
+local uint weightBoneCount;
+struct ModelWeights
+{
+    float Weight[VertexCount];
+};
+
+struct ModelWeightsArray
+{
+    ModelWeights Bone[weightBoneCount] <optimize=false>;
+};
+
+struct ModelUVs
+{
+    float uCoord;
+    float vCoord;
+};
+struct ModelUVsArray
+{
+    ModelUVs UVs[VertexCount];
+};
+
+struct ModelVertices
+{
+    float xPos;
+    float yPos;
+    float zPos;
+};
+struct ModelVerticesArray
+{
+    ModelVertices Vertices[VertexCount];
+};
+local uint PolyCount;
+
+struct ModelFaces
+{
+    short verticeIndex1;
+    short verticeIndex2;
+    short verticeIndex3;
+};
+struct ModelFacesArray
+{
+    ModelFaces Polys[PolyCount];
+};
+struct ModelNormals
+{
+    float x;
+    float y;
+    float z;
+};
+struct ModelNormalsArray
+{
+    ModelNormals Normals[VertexCount];
+};
+struct ModelColors
+{
+    float r;
+    float g;
+    float b;
+    float a;
+};
+struct ModelColorsArray
+{
+    ModelColors Colors[VertexCount];
+};
+
+local int i;
+local int j;
+local uint meshy;
+local uint childy;
+for (i = 0; i < header.totalNodeCount; i++) {
+    FSeek(AllNodeNames[i].DataOffset);
+    BoneyData node;
+    meshy = node.modelObjectArrayOffset;
+    childy = node.childrenArrayOffset;
+    if (meshy > 0) {
+        FSeek(meshy);       
+        j = 0;
+        while (true) {
+            FSeek(meshy + j*4);
+            uint submeshOffset;            
+            if (submeshOffset == 0) {
+                break;
+            }            
+            FSeek(submeshOffset);            
+            ModelObject submeshData;
+            
+            weightBoneCount = submeshData.SkinnedBonesCount;
+            VertexCount = submeshData.vertexCount;
+            PolyCount = submeshData.triangleCount;
+            
+            if (submeshData.posBufferOffset > 0) {
+                FSeek(submeshData.posBufferOffset);
+                ModelVerticesArray SubmeshVerticesPos;
+            }
+            if (submeshData.normalBufferOffset > 0) {
+                FSeek(submeshData.normalBufferOffset);
+                ModelNormalsArray SubmeshNormals;
+            }
+            if (submeshData.colorBufferOffset > 0) {
+                FSeek(submeshData.colorBufferOffset);
+                ModelColorsArray SubmeshColors;
+            }        
+            if (submeshData.uvBufferOffset > 0) {
+                FSeek(submeshData.uvBufferOffset);
+                ModelUVsArray SubmeshUVs;
+            }
+            if (submeshData.uv2BufferOffset > 0) {
+                FSeek(submeshData.uv2BufferOffset);
+                ModelUVsArray SubmeshUV2s;
+            }
+            if (submeshData.uv3BufferOffset > 0) {
+                FSeek(submeshData.uv3BufferOffset);
+                ModelUVsArray SubmeshUV3s;
+            }
+            if (submeshData.uv4BufferOffset > 0) {
+                FSeek(submeshData.uv4BufferOffset);
+                ModelUVsArray SubmeshUV4s;
+            }
+            if (submeshData.indexBufferOffset > 0) {
+                FSeek(submeshData.indexBufferOffset);
+                ModelFacesArray PolygonIndex;
+            }
+            if (submeshData.WeightOffset > 0) {
+                FSeek(submeshData.WeightOffset);
+                ModelWeightsArray SubmeshWeights;
+            }
+            j++;
+        }
+    }
+    if (childy > 0) {
+        FSeek(childy);
+        uint childArrayFirst;
+    }
+}
