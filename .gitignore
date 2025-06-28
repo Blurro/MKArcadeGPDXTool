@@ -2,7 +2,7 @@
 x64/
 Debug/
 Release/
-flipnoteaudiothing/x64/
+MKArcadeGPDXTool/x64/
 *.log
 *.obj
 *.pch
