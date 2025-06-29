@@ -1,7 +1,7 @@
 # MKArcadeGPDXTool
 Tool that extracts/imports Mario Kart Arcade GP DX model files. Well the importing is currently WIP, but exporting .dae files is here!
 
-I'm antsy waiting for the Switch 2 to be hacked so I can dive right into making my first (or possibly THE first) MK World custom character, but since that isn't here yet I figured I'd get some practice in by looking at one of the few remaining never hacked Mario Karts!
+I'm antsy waiting for the Switch 2 to be hacked so I can dive right into making my first (or possibly THE first) MK World custom character, but since that isn't here yet I figured I'd get some practice in by looking at one of the few remaining unmodded Mario Karts!
 
 ## Credits
 

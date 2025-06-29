@@ -80,6 +80,99 @@ void PatchDaeFile(const std::string& filePath) {
     }
 }
 
+void GetDaeNormals(const std::string& outFile) {
+    std::ifstream dae(outFile.c_str());
+    if (!dae.is_open()) {
+        std::cerr << "couldn't open dae file\n";
+        return;
+    }
+
+    std::string line;
+    std::vector<std::pair<std::string, std::vector<Vec3> > > meshNormals;
+    std::string currentMesh;
+    std::vector<float> currentNormals;
+
+    while (std::getline(dae, line)) {
+        if (line.find("<geometry") != std::string::npos && line.find("name=\"") != std::string::npos) {
+            size_t nameStart = line.find("name=\"") + 6;
+            size_t nameEnd = line.find("\"", nameStart);
+            if (nameEnd != std::string::npos) {
+                std::string rawName = line.substr(nameStart, nameEnd - nameStart);
+                for (size_t i = 0; i < rawName.size(); ++i) {
+                    if (rawName[i] == '.')
+                        rawName.replace(i, 1, "FBXASC046"), i += sizeof("FBXASC046") - 2;
+                }
+                currentMesh = rawName + "Shape";
+                currentNormals.clear();
+                //std::cout << "Retrieved name: " << currentMesh << "\n";
+            }
+        }
+        else {
+            std::string lowerLine = line;
+            std::transform(lowerLine.begin(), lowerLine.end(), lowerLine.begin(), ::tolower);
+
+            if (!currentMesh.empty() && lowerLine.find("<float_array") != std::string::npos && lowerLine.find("normal") != std::string::npos) {
+                std::string floatData;
+
+                size_t gtPos = line.find('>');
+                if (gtPos != std::string::npos)
+                    floatData += line.substr(gtPos + 1);
+
+                while (line.find("</float_array>") == std::string::npos && std::getline(dae, line))
+                    floatData += " " + line;
+
+                size_t ltPos = floatData.find('<');
+                if (ltPos != std::string::npos)
+                    floatData = floatData.substr(0, ltPos);
+
+                std::istringstream iss(floatData);
+                float f;
+                currentNormals.clear();
+                while (iss >> f)
+                    currentNormals.push_back(f);
+
+                std::vector<Vec3> vecs;
+                for (size_t i = 0; i + 2 < currentNormals.size(); i += 3)
+                    vecs.push_back(Vec3{ currentNormals[i], currentNormals[i + 1], currentNormals[i + 2] });
+
+                meshNormals.push_back(std::make_pair(currentMesh, vecs));
+                currentMesh.clear();
+            }
+        }
+    }
+
+    dae.close();
+
+    std::string outputName = outFile.substr(0, outFile.find_last_of('.')) + "_normals.txt";
+    std::ofstream py(outputName.c_str());
+    if (!py.is_open()) {
+        std::cerr << "couldn't write normals txt file\n";
+        return;
+    }
+
+    py << "import maya.cmds as cmds\n\n";
+
+    for (size_t i = 0; i < meshNormals.size(); ++i) {
+        const std::string& mesh = meshNormals[i].first;
+        const std::vector<Vec3>& normals = meshNormals[i].second;
+
+        py << "mesh = \"" << mesh << "\"\n";
+        py << "normals = [";
+        for (size_t j = 0; j < normals.size(); ++j) {
+            const Vec3& n = normals[j];
+            py << "(" << n.x << "," << n.y << "," << n.z << ")";
+            if (j + 1 < normals.size()) py << ",";
+        }
+        py << "]\n";
+        py << "for i, (x, y, z) in enumerate(normals):\n";
+        py << "    cmds.polyNormalPerVertex(f\"{mesh}.vtx[{i}]\", xyz=(x, y, z))\n\n";
+    }
+
+    py.close();
+
+	std::cout << "\nMaya py script to import normals after dae import: " << outputName << " <- run that in script editor!\n";
+}
+
 void RenameNode(uint32_t root, uint32_t current, std::vector<NodeNames>& allNodeNames, const std::vector<FullNodeData>& fullNodeDataList)
 {
     auto& rootName = allNodeNames[root].Name;
@@ -177,8 +270,6 @@ void SaveDaeFile(const std::string& path, Header& headerData, std::vector<Materi
         float ambientColor[3] = { 0.5f, 0.5f, 0.5f };
         scene->mMaterials[i]->AddProperty(ambientColor, 3, AI_MATKEY_COLOR_AMBIENT);
     }
-
-
 
     // big loop that merges submeshes
     for (size_t nodeIndex = 0; nodeIndex < fullNodeDataList.size(); nodeIndex++) {
@@ -393,7 +484,54 @@ void SaveDaeFile(const std::string& path, Header& headerData, std::vector<Materi
                 globalVertexOffset += nodeData.subMeshes[s].VertexCount;
         }
 
+		// if no bones were added, add the first non mesh parent bone with full weights BLENDER ANIMATION FIX ONLY, REMOVED CUS MAYA DOES NOT LIKE THIS (and it'd be a pain for an importer to handle this case anyway)
+		bool blender = false;
+        if (blender) {
+            if (boneWeightsMap.empty()) {
+                int fallbackBoneNodeIndex = static_cast<int>(nodeIndex);
+                bool foundValidParent = false;
+
+                while (true) {
+                    int parentIndex = -1;
+                    for (size_t i = 0; i < fullNodeDataList.size(); ++i) {
+                        if (std::find(fullNodeDataList[i].childrenIndexList.begin(),
+                            fullNodeDataList[i].childrenIndexList.end(),
+                            fallbackBoneNodeIndex) != fullNodeDataList[i].childrenIndexList.end()) {
+                            parentIndex = static_cast<int>(i);
+                            break;
+                        }
+                    }
+
+                    if (parentIndex == -1) break; // no parent found, give up
+
+                    if (fullNodeDataList[parentIndex].subMeshes.empty()) {
+                        fallbackBoneNodeIndex = parentIndex;
+                        foundValidParent = true;
+                        break;
+                    }
+
+                    fallbackBoneNodeIndex = parentIndex;
+                }
+
+                if (foundValidParent) {
+                    std::vector<aiVertexWeight> fullWeights;
+                    for (unsigned int i = 0; i < mesh->mNumVertices; ++i)
+                        fullWeights.emplace_back(i, 1.0f);
+
+                    boneWeightsMap[static_cast<uint32_t>(fallbackBoneNodeIndex)] = std::move(fullWeights);
+                    std::cout << "[fallback bone] mesh " << allNodeNames[nodeIndex].Name << " had no skinning, added dummy bone weights to valid parent "
+                        << allNodeNames[fallbackBoneNodeIndex].Name << ".\n";
+                }
+                else {
+                    std::cout << "[fallback bone] mesh " << allNodeNames[nodeIndex].Name << " had no skinning and no valid parent found, skipping fallback.\n";
+                }
+            }
+        }
+
+        // add all bones with 0 weights so that blender recognises it all as a skeleton
+
         mesh->mNumBones = 0;
+
         for (const auto& kv : nodeMap) {
             aiNode* node = kv.second;
             if (node->mNumMeshes > 0) continue; // skip nodes that host meshes
@@ -426,15 +564,18 @@ void SaveDaeFile(const std::string& path, Header& headerData, std::vector<Materi
             }
             mesh->mBones[static_cast<unsigned int>(boneIdx++)] = static_cast<aiBone*>(bone);
         }
-        std::cout << std::endl << "Processed mesh " << allNodeNames[nodeIndex].Name << std::endl;
+        // modify the bone with this index
+        std::cout << std::endl << "Processed mesh " << allNodeNames[nodeIndex].Name;
     }
+    std::cout << std::endl;
 
     // export
     std::string outFile = path.substr(0, path.find_last_of('.')) + "_out.dae";
     Assimp::Exporter exporter;
     aiReturn rc = exporter.Export(scene, "collada", outFile);
     PatchDaeFile(outFile);
-    std::cout << std::endl << "Saved file as " << outFile << std::endl << "Import to Blender to retain normals, Maya likes to ignore them!" << std::endl;
+	GetDaeNormals(outFile);
+    std::cout << std::endl << "Saved file as " << outFile << std::endl << "Maya users make sure to run the script saved above if dae import skips normals" << std::endl;
 }
 
 void SaveMKDXFile(const std::string& path, Header& headerData, std::vector<Material>& materialsData,

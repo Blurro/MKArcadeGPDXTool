@@ -92,3 +92,7 @@ struct NodeLinks {
     uint32_t MeshOffset;
     std::vector<uint32_t> BoneOffsets;
 };
+
+struct Vec3 {
+    float x, y, z;
+};

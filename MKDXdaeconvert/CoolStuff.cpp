@@ -266,7 +266,7 @@ int main(int argc, char* argv[])
 
         auto boneIt = std::find_if(boneNames.begin(), boneNames.end(), [boneOffset](const NodeNames& n) { return n.DataOffset == boneOffset; });
         std::string boneName = (boneIt != boneNames.end()) ? boneIt->Name : "(unknown)";
-        std::cout << "Linked meshOffset " << std::hex << meshOffset << " to boneOffset " << boneOffset << " (" << boneName << ")\n";
+        //std::cout << "Linked meshOffset " << std::hex << meshOffset << " to boneOffset " << boneOffset << " (" << boneName << ")\n";
     }
 
     // read all node names
