@@ -17,8 +17,8 @@
 #include <assimp/DefaultLogger.hpp>
 
 aiNode* BuildAiNode(uint32_t index, const std::vector<NodeNames>& allNodeNames,
-                    const std::vector<FullNodeData>& fullNodeDataList,
-                    std::unordered_map<uint32_t, aiNode*>& nodeMap)
+    const std::vector<FullNodeData>& fullNodeDataList,
+    std::unordered_map<uint32_t, aiNode*>& nodeMap)
 {
     aiNode* node = new aiNode();
     node->mName = allNodeNames[index].Name;
@@ -26,7 +26,7 @@ aiNode* BuildAiNode(uint32_t index, const std::vector<NodeNames>& allNodeNames,
 
     const auto& nodeData = fullNodeDataList[index];
     node->mNumChildren = static_cast<unsigned int>(nodeData.childrenIndexList.size());
-    node->mChildren = new aiNode*[node->mNumChildren];
+    node->mChildren = new aiNode * [node->mNumChildren];
 
     for (unsigned int i = 0; i < node->mNumChildren; i++) {
         uint32_t childIdx = nodeData.childrenIndexList[i];
@@ -37,20 +37,32 @@ aiNode* BuildAiNode(uint32_t index, const std::vector<NodeNames>& allNodeNames,
     return node;
 }
 
-void PatchDaeFile(const std::string& filePath) {
-    std::ifstream in(filePath);
-    if (!in.is_open()) return; // bail if can't open
+void EraseWholeLineContaining(std::string& str, const std::string& target, size_t startPos = 0) {
+    size_t tagPos = str.find(target, startPos);
+    if (tagPos == std::string::npos) return;
 
+    size_t lineStart = str.rfind('\n', tagPos);
+    size_t lineEnd = str.find('\n', tagPos);
+
+    if (lineStart == std::string::npos) lineStart = 0;
+    else lineStart++; // move to start of the line after \n
+
+    if (lineEnd != std::string::npos) lineEnd++; // include the newline
+    else lineEnd = str.size(); // in case it's the last line
+
+    str.erase(lineStart, lineEnd - lineStart);
+}
+
+void PatchDaeFile(const std::string& filePath, const std::vector<std::vector<std::pair<unsigned int, std::vector<unsigned int>>>>& allMaterialToIndices) {
+    std::ifstream in(filePath);
     std::stringstream buffer;
     buffer << in.rdbuf();
     in.close();
 
     std::string content = buffer.str();
 
-    // delete unit line
-    size_t unitPos = content.find("<unit name=\"meter\" meter=\"1\" />");
-    if (unitPos != std::string::npos)
-        content.erase(unitPos, strlen("<unit name=\"meter\" meter=\"1\" />\n    "));
+    // delete unit line else maya will import at scale 100, or blender at 100x smaller, they just dont agree
+    EraseWholeLineContaining(content, "<unit name=\"meter\" meter=\"1\" />");
 
     // contributor block (insert blurro & mkdxtool above assimp block)
     size_t contribPos = content.find("<contributor>");
@@ -69,8 +81,215 @@ void PatchDaeFile(const std::string& filePath) {
         }
     }
 
-    //unitPos = content.find("<up_axis>Y_UP</up_axis>");
-    //if (unitPos != std::string::npos) content.replace(unitPos, strlen("<up_axis>Y_UP</up_axis>"), "<up_axis>Z_UP</up_axis>");
+    // below is for adding materials to a mesh cus assimp can only do 1 mat per mesh
+
+    // turn polylist block to triangles
+    size_t searchPos = 0;
+    while ((searchPos = content.find("<polylist", searchPos)) != std::string::npos) {
+        size_t lineEnd = content.find('>', searchPos);
+        if (lineEnd == std::string::npos) break;
+
+        // grab and modify line
+        std::string originalLine = content.substr(searchPos, lineEnd - searchPos + 1);
+        std::string modifiedLine = originalLine;
+        size_t polylistNamePos = modifiedLine.find("polylist");
+        if (polylistNamePos != std::string::npos)
+            modifiedLine.replace(polylistNamePos, strlen("polylist"), "triangles");
+
+        //std::cout << modifiedLine << std::endl;
+
+        content.replace(searchPos, lineEnd - searchPos + 1, modifiedLine);
+        searchPos += modifiedLine.length();
+
+        // nuke <vcount> line
+        size_t vcountPos = content.find("<vcount>", searchPos);
+        if (vcountPos != std::string::npos) {
+            size_t vcountEnd = content.find("</vcount>", vcountPos);
+            if (vcountEnd != std::string::npos)
+                EraseWholeLineContaining(content, "<vcount>", searchPos);
+        }
+
+        // fix closing tag
+        size_t closeTagPos = content.find("</polylist>", searchPos);
+        if (closeTagPos != std::string::npos)
+            content.replace(closeTagPos, strlen("</polylist>"), "</triangles>");
+    }
+
+    // split triangles block per material
+
+    size_t filePos = 0;
+    for (size_t meshIdx = 0; meshIdx < allMaterialToIndices.size(); meshIdx++) {
+        int processedMats = 0;
+        // find next <geometry
+        size_t geoStart = content.find("<geometry", filePos);
+        if (geoStart == std::string::npos) break;
+
+		// get geometry id
+        std::string geometryId;
+        size_t idPos = content.find("id=\"", geoStart);
+        if (idPos != std::string::npos) {
+            size_t startQuote = idPos + 4;
+            size_t endQuote = content.find('"', startQuote);
+            if (endQuote != std::string::npos) {
+                geometryId = content.substr(startQuote, endQuote - startQuote);
+                //std::cout << "geometry id: " << geometryId << std::endl;
+            }
+        }
+
+        // find next <triangles inside geometry
+        size_t triStart = content.find("<triangles", geoStart);
+        size_t lineStart = content.rfind('\n', triStart);
+        if (lineStart == std::string::npos) lineStart = 0;
+        else lineStart++; // move past the '\n'
+        triStart = lineStart;
+
+        // fetch the updated triangles block after erase
+        size_t triEnd = content.find("</triangles>", triStart);
+        if (triEnd == std::string::npos) break;
+        triEnd += strlen("</triangles>"); // include closing tag
+
+        // get material count for this mesh
+        size_t matCount = allMaterialToIndices[meshIdx].size();
+        // skip duplicating if only 1 mat
+        if (matCount <= 1) { // debug change number to high to skip all
+            filePos = triEnd; // move forward past this triangles block so next loop can find next geometry
+            continue;
+        }
+
+        // yeet p line but keep entering <p> tag
+        size_t pStart = content.find("<p>", triStart);
+        if (pStart != std::string::npos) {
+            size_t pEnd = content.find("</p>", pStart);
+            if (pEnd != std::string::npos) {
+                // erase from just after <p> (pStart + 3) to after </p> (pEnd + 4)
+                content.erase(pStart + 3, (pEnd + 4) - (pStart + 3));
+            }
+        }
+
+        triEnd = content.find("</triangles>", triStart);
+        if (triEnd == std::string::npos) break;
+        triEnd += strlen("</triangles>");
+        filePos = triEnd;
+
+        std::string triBlock = content.substr(triStart, triEnd - triStart);
+
+        // prepare new triangles blocks concatenated
+        std::string newTrianglesBlocks;
+
+        for (size_t matIdx = 0; matIdx < matCount; matIdx++) {
+            std::string duplicatedBlock = triBlock;
+
+            // print material index to console
+            //std::cout << "mesh " << meshIdx << " material index: " << allMaterialToIndices[meshIdx][matIdx].first << std::endl;
+
+            // replace count attribute in <triangles> tag
+            size_t countPos = duplicatedBlock.find("count=");
+            if (countPos != std::string::npos) {
+                size_t quoteStart = duplicatedBlock.find('"', countPos);
+                size_t quoteEnd = duplicatedBlock.find('"', quoteStart + 1);
+                if (quoteStart != std::string::npos && quoteEnd != std::string::npos)
+                    duplicatedBlock.replace(quoteStart + 1, quoteEnd - quoteStart - 1, std::to_string(allMaterialToIndices[meshIdx][matIdx].second.size() / 3));
+            }
+            // replace material attribute in <triangles> tag
+            size_t matAttrPos = duplicatedBlock.find("material=");
+            if (matAttrPos != std::string::npos) {
+                size_t quoteStart = duplicatedBlock.find('"', matAttrPos);
+                size_t quoteEnd = duplicatedBlock.find('"', quoteStart + 1);
+                if (quoteStart != std::string::npos && quoteEnd != std::string::npos)
+                    duplicatedBlock.replace(quoteStart + 1, quoteEnd - quoteStart - 1, "defaultMaterial" + std::to_string(allMaterialToIndices[meshIdx][matIdx].first));
+            }
+
+			// add data after <p> tag with indices for this material
+            size_t pPos = duplicatedBlock.find("<p>");
+            if (pPos != std::string::npos) {
+                pPos += 3; // after "<p>"
+
+                std::string indicesStr;
+                for (auto idx : allMaterialToIndices[meshIdx][matIdx].second)
+                    indicesStr += std::to_string(idx) + " ";
+                if (!indicesStr.empty()) indicesStr.pop_back(); // trim trailing space
+
+                duplicatedBlock.insert(pPos, indicesStr + "</p>");
+            }
+
+            newTrianglesBlocks += duplicatedBlock;
+            if (matIdx != matCount - 1) newTrianglesBlocks += "\n"; // add newline between blocks except last
+
+            processedMats++;
+        }
+
+        // replace original triangles block with new concatenated ones
+        content.replace(triStart, triEnd - triStart, newTrianglesBlocks);
+
+        // update filePos so next search starts after the new blocks
+        filePos = triStart + newTrianglesBlocks.length();
+
+		// find instance_geometry line and patch it with extra material
+        size_t searchPos = filePos;
+        std::string searchStr = "url=\"#" + geometryId + "-skin\"";
+        while (true) {
+            size_t instancePos = content.find("<instance_controller", searchPos);
+            if (instancePos == std::string::npos) break;
+
+            size_t lineStart = content.rfind('\n', instancePos);
+            if (lineStart == std::string::npos) lineStart = 0; else lineStart++;
+            size_t lineEnd = content.find('\n', instancePos);
+            if (lineEnd == std::string::npos) lineEnd = content.length();
+
+            std::string line = content.substr(lineStart, lineEnd - lineStart);
+
+            if (line.find(searchStr) != std::string::npos) {
+                //std::cout << "Found instance_controller line: " << line << std::endl;
+                searchPos = instancePos;
+                break;
+            }
+            searchPos = lineEnd + 1; // move past this line for next search
+        }
+
+		// do the instance_material block duplication after finding the right instance_controller
+        size_t matStart = content.find("<instance_material", searchPos);
+        if (matStart == std::string::npos) {
+            std::cerr << "no instance_material found after instance_controller\n";
+        }
+        else {
+            size_t matEnd = content.find("</instance_material>", matStart);
+
+            matEnd += strlen("</instance_material>");
+            size_t lineStart = content.rfind('\n', matStart);
+            if (lineStart == std::string::npos) lineStart = 0; else lineStart++; // move past newline
+            std::string instanceMaterialBlock = content.substr(lineStart, matEnd - lineStart);
+
+            // duplicate instance_material blocks per material
+            std::string newInstanceMaterials;
+            for (size_t matIdx = 0; matIdx < matCount; matIdx++) {
+                std::string block = instanceMaterialBlock;
+
+                size_t symPos = block.find("symbol=");
+                if (symPos != std::string::npos) {
+                    size_t qStart = block.find('"', symPos);
+                    size_t qEnd = block.find('"', qStart + 1);
+                    if (qStart != std::string::npos && qEnd != std::string::npos)
+                        block.replace(qStart + 1, qEnd - qStart - 1, "defaultMaterial" + std::to_string(allMaterialToIndices[meshIdx][matIdx].first));
+                }
+
+                size_t tgtPos = block.find("target=");
+                if (tgtPos != std::string::npos) {
+                    size_t qStart = block.find('"', tgtPos);
+                    size_t qEnd = block.find('"', qStart + 1);
+                    if (qStart != std::string::npos && qEnd != std::string::npos)
+                        block.replace(qStart + 1, qEnd - qStart - 1, "#material_" + std::to_string(allMaterialToIndices[meshIdx][matIdx].first));
+                }
+
+                newInstanceMaterials += block;
+                if (matIdx != matCount - 1) newInstanceMaterials += "\n";
+            }
+
+            // replace original instance_material block with the new ones
+            content.replace(lineStart, matEnd - lineStart, newInstanceMaterials);
+        }
+
+        std::cout << "Split mesh " << geometryId << " to have " << processedMats << " extra mat(s)" << std::endl;
+    }
 
     // write patched file back
     std::ofstream out(filePath);
@@ -167,10 +386,16 @@ void GetDaeNormals(const std::string& outFile) {
         py << "for i, (x, y, z) in enumerate(normals):\n";
         py << "    cmds.polyNormalPerVertex(f\"{mesh}.vtx[{i}]\", xyz=(x, y, z))\n\n";
     }
+    // write joint resizing to have a better radius cus may aswell
+    py << "# resize all joints radius\n";
+    py << "joints = cmds.ls(type='joint')\n";
+    py << "for j in joints:\n";
+    py << "    if cmds.attributeQuery('radius', node=j, exists=True):\n";
+    py << "        cmds.setAttr(f\"{j}.radius\", 0.3)";
 
     py.close();
 
-	std::cout << "\nMaya py script to import normals after dae import: " << outputName << " <- run that in script editor!\n";
+    std::cout << "\nMaya py script to import normals after dae import: " << outputName << " <- run that in script editor!\n";
 }
 
 void RenameNode(uint32_t root, uint32_t current, std::vector<NodeNames>& allNodeNames, const std::vector<FullNodeData>& fullNodeDataList)
@@ -184,7 +409,7 @@ void RenameNode(uint32_t root, uint32_t current, std::vector<NodeNames>& allNode
         currentName = currentName.substr(prefix.size());
     }
 
-    // now recurse into children of current
+    // recurse into children of current
     for (auto childIdx : fullNodeDataList[current].childrenIndexList) {
         RenameNode(root, childIdx, allNodeNames, fullNodeDataList);
     }
@@ -224,7 +449,7 @@ void SaveDaeFile(const std::string& path, Header& headerData, std::vector<Materi
     scene->mRootNode->mChildren = new aiNode * [1] { armatureNode };
     armatureNode->mParent = scene->mRootNode;
 
-    // now build all your skeleton nodes as children of armatureNode
+    // build all skeleton nodes as children of armatureNode
 
     std::unordered_map<uint32_t, aiNode*> nodeMap;
     size_t numSkeletonRoots = rootNodes.size();
@@ -271,6 +496,9 @@ void SaveDaeFile(const std::string& path, Header& headerData, std::vector<Materi
         scene->mMaterials[i]->AddProperty(ambientColor, 3, AI_MATKEY_COLOR_AMBIENT);
     }
 
+    // used for post processing dae patching to fix materials on a single mesh, assimp can only export 1 mat per mesh
+    std::vector<std::vector<std::pair<unsigned int, std::vector<unsigned int>>>> allMaterialToIndices;
+
     // big loop that merges submeshes
     for (size_t nodeIndex = 0; nodeIndex < fullNodeDataList.size(); nodeIndex++) {
         const auto& nodeData = fullNodeDataList[nodeIndex];
@@ -301,8 +529,6 @@ void SaveDaeFile(const std::string& path, Header& headerData, std::vector<Materi
 
         aiNode* parentNode = nodeMap[static_cast<unsigned int>(nodeIndex)];
 
-        if (nodeData.subMeshes.empty()) continue;
-
         std::vector<aiVector3D> mergedVerts;
         std::vector<aiVector3D> mergedNorms;
         std::vector<aiColor4D> mergedColors;
@@ -310,6 +536,10 @@ void SaveDaeFile(const std::string& path, Header& headerData, std::vector<Materi
         std::vector<aiFace> mergedFaces;
 
         unsigned int vertexOffset = 0;
+
+        // used for post processing dae patching to fix materials on a single mesh (this var is per mesh, and is to be added to the 'all' var containing data for all meshes)
+        std::vector<std::pair<unsigned int, std::vector<unsigned int>>> materialToIndicesOrdered;
+        std::unordered_map<unsigned int, size_t> matIndexToOrder;
 
         for (size_t s = 0; s < nodeData.subMeshes.size(); s++) {
             std::vector<float> vertsFlat = nodeData.verticesList[s];
@@ -357,7 +587,7 @@ void SaveDaeFile(const std::string& path, Header& headerData, std::vector<Materi
             // add verts, norms, uvs
             mergedVerts.insert(mergedVerts.end(), verts.begin(), verts.end());
 
-			// remap indices for this submesh
+            // remap indices for this submesh
             std::vector<unsigned int> remappedIndices;
             remappedIndices.reserve(verts.size());
             for (size_t i = 0; i < verts.size(); ++i)
@@ -378,10 +608,23 @@ void SaveDaeFile(const std::string& path, Header& headerData, std::vector<Materi
                         static_cast<unsigned int>(rawIndices[i + 2]) + vertexOffset
                     };
                 mergedFaces.push_back(face);
+
+                // store in materialToIndices map for later dae post processing
+                unsigned int matIndex = nodeData.subMeshes[s].MaterialIndex;
+                if (!matIndexToOrder.count(matIndex)) {
+                    matIndexToOrder[matIndex] = materialToIndicesOrdered.size();
+                    materialToIndicesOrdered.emplace_back(matIndex, std::vector<unsigned int>());
+                }
+                auto& indicesVec = materialToIndicesOrdered[matIndexToOrder[matIndex]].second;
+                indicesVec.push_back(face.mIndices[0]);
+                indicesVec.push_back(face.mIndices[1]);
+                indicesVec.push_back(face.mIndices[2]);
             }
 
             vertexOffset += static_cast<unsigned int>(verts.size());
         }
+		// store material to indices mapping for this mesh
+        allMaterialToIndices.push_back(std::move(materialToIndicesOrdered));
 
         // create merged mesh
         auto* mergedMesh = new aiMesh();
@@ -484,8 +727,8 @@ void SaveDaeFile(const std::string& path, Header& headerData, std::vector<Materi
                 globalVertexOffset += nodeData.subMeshes[s].VertexCount;
         }
 
-		// if no bones were added, add the first non mesh parent bone with full weights BLENDER ANIMATION FIX ONLY, REMOVED CUS MAYA DOES NOT LIKE THIS (and it'd be a pain for an importer to handle this case anyway)
-		bool blender = false;
+        // if no bones were added, add the first non mesh parent bone with full weights BLENDER ANIMATION FIX ONLY, REMOVED CUS MAYA DOES NOT LIKE THIS (and it'd be a pain for an importer to handle this case anyway)
+        bool blender = false;
         if (blender) {
             if (boneWeightsMap.empty()) {
                 int fallbackBoneNodeIndex = static_cast<int>(nodeIndex);
@@ -535,6 +778,10 @@ void SaveDaeFile(const std::string& path, Header& headerData, std::vector<Materi
         for (const auto& kv : nodeMap) {
             aiNode* node = kv.second;
             if (node->mNumMeshes > 0) continue; // skip nodes that host meshes
+
+            //auto it = boneWeightsMap.find(nodeIndex);
+            //if (it == boneWeightsMap.end() || it->second.empty()) continue; // skip nodes with no weights
+
             mesh->mNumBones++;
         }
 
@@ -567,14 +814,14 @@ void SaveDaeFile(const std::string& path, Header& headerData, std::vector<Materi
         // modify the bone with this index
         std::cout << std::endl << "Processed mesh " << allNodeNames[nodeIndex].Name;
     }
-    std::cout << std::endl;
+    std::cout << std::endl << "Writing..." << std::endl;
 
     // export
     std::string outFile = path.substr(0, path.find_last_of('.')) + "_out.dae";
     Assimp::Exporter exporter;
     aiReturn rc = exporter.Export(scene, "collada", outFile);
-    PatchDaeFile(outFile);
-	GetDaeNormals(outFile);
+    PatchDaeFile(outFile, allMaterialToIndices);
+    GetDaeNormals(outFile);
     std::cout << std::endl << "Saved file as " << outFile << std::endl << "Maya users make sure to run the script saved above if dae import skips normals" << std::endl;
 }
 

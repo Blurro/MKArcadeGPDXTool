@@ -187,7 +187,7 @@ SubMesh ReadSubMesh(std::istream& stream) {
 int main(int argc, char* argv[])
 {
     std::cout << "\033[34mVery epic mkagpdx dae tool\033[37m\n";
-    std::cout << "Time to get some exporties donezies\n\n";
+    std::cout << "Cool tool for some exports and soon some imports too\n\n";
 
     // get exe directory
     std::string filePathInput;
@@ -199,7 +199,7 @@ int main(int argc, char* argv[])
         }
     }
 	// debug default file path
-    //if (filePathInput.empty()) filePathInput = "./it_banana.bin";
+    //if (filePathInput.empty()) filePathInput = "./KO_C_N_areaC3.bin";
 
     if (filePathInput.empty()) {
         std::cerr << "Usage for dae export: Drag and drop a .bin file onto the tool, or use command 'MKDXtool.exe <file path>'\n";
