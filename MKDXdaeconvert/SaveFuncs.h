@@ -11,4 +11,4 @@ void SaveMKDXFile(const std::string& path, Header& headerData, std::vector<Mater
 
 void SaveDaeFile(const std::string& path, Header& headerData, std::vector<Material>& materialsData, std::vector<TextureName>& textureNames,
     std::vector<NodeLinks>& nodeLinks, std::vector<NodeNames>& allNodeNames,
-    std::vector<uint32_t>& rootNodes, std::vector<FullNodeData>& fullNodeDataList);
+    std::vector<uint32_t>& rootNodes, std::vector<FullNodeData>& fullNodeDataList, const bool mergeSubmeshes);
