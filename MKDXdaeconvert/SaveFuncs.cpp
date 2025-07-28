@@ -1,4 +1,3 @@
-#include "SaveFuncs.h"
 #include <assimp/scene.h>
 #include <assimp/Exporter.hpp>
 #include <iostream>
@@ -15,6 +14,9 @@
 #include <vector>
 #include <regex>
 #include <assimp/DefaultLogger.hpp>
+#include <Windows.h>
+
+#include "SaveFuncs.h"
 
 aiNode* BuildAiNode(uint32_t index, const std::vector<NodeNames>& allNodeNames,
     const std::vector<FullNodeData>& fullNodeDataList,
@@ -53,348 +55,61 @@ void EraseWholeLineContaining(std::string& str, const std::string& target, size_
     str.erase(lineStart, lineEnd - lineStart);
 }
 
-void PatchDaeFile(const std::string& filePath, const std::vector<std::vector<std::pair<unsigned int, std::vector<unsigned int>>>>& allMaterialToIndices) {
-    std::ifstream in(filePath);
-    std::stringstream buffer;
-    buffer << in.rdbuf();
-    in.close();
+void SerializeAllMatToIndices(const std::string& path, const std::vector<std::vector<std::pair<unsigned int, std::vector<unsigned int>>>>& allMaterialToIndices) {
+    std::ofstream file(path);
+    if (!file.is_open()) return;
 
-    std::string content = buffer.str();
-
-    // delete unit line else maya will import at scale 100, or blender at 100x smaller, they just dont agree
-    EraseWholeLineContaining(content, "<unit name=\"meter\" meter=\"1\" />");
-
-    // contributor block (insert blurro & mkdxtool above assimp block)
-    size_t contribPos = content.find("<contributor>");
-    if (contribPos != std::string::npos) {
-        std::string newContrib =
-            "<contributor>\n"
-            "      <author>Blurro</author>\n"
-            "      <authoring_tool>MKDXtool</authoring_tool>\n"
-            "    </contributor>\n    ";
-
-        // find end of existing contributor block to insert new one before
-        size_t endContribPos = content.find("</contributor>", contribPos);
-        if (endContribPos != std::string::npos) {
-            // insert new contributor before existing one
-            content.insert(contribPos, newContrib);
+    for (const auto& mesh : allMaterialToIndices) {
+        file << "mesh\n";
+        for (const auto& mat : mesh) {
+            file << mat.first << ":";
+            for (auto idx : mat.second)
+                file << idx << ",";
+            file << "\n";
         }
+        file << "endmesh\n";
     }
-
-    // below is for adding materials to a mesh cus assimp can only do 1 mat per mesh
-
-    // turn polylist block to triangles
-    size_t searchPos = 0;
-    while ((searchPos = content.find("<polylist", searchPos)) != std::string::npos) {
-        size_t lineEnd = content.find('>', searchPos);
-        if (lineEnd == std::string::npos) break;
-
-        // grab and modify line
-        std::string originalLine = content.substr(searchPos, lineEnd - searchPos + 1);
-        std::string modifiedLine = originalLine;
-        size_t polylistNamePos = modifiedLine.find("polylist");
-        if (polylistNamePos != std::string::npos)
-            modifiedLine.replace(polylistNamePos, strlen("polylist"), "triangles");
-
-        //std::cout << modifiedLine << std::endl;
-
-        content.replace(searchPos, lineEnd - searchPos + 1, modifiedLine);
-        searchPos += modifiedLine.length();
-
-        // nuke <vcount> line
-        size_t vcountPos = content.find("<vcount>", searchPos);
-        if (vcountPos != std::string::npos) {
-            size_t vcountEnd = content.find("</vcount>", vcountPos);
-            if (vcountEnd != std::string::npos)
-                EraseWholeLineContaining(content, "<vcount>", searchPos);
-        }
-
-        // fix closing tag
-        size_t closeTagPos = content.find("</polylist>", searchPos);
-        if (closeTagPos != std::string::npos)
-            content.replace(closeTagPos, strlen("</polylist>"), "</triangles>");
-    }
-
-    // split triangles block per material
-
-    size_t filePos = 0;
-    for (size_t meshIdx = 0; meshIdx < allMaterialToIndices.size(); meshIdx++) {
-        int processedMats = 0;
-        // find next <geometry
-        size_t geoStart = content.find("<geometry", filePos);
-        if (geoStart == std::string::npos) break;
-
-		// get geometry id
-        std::string geometryId;
-        size_t idPos = content.find("id=\"", geoStart);
-        if (idPos != std::string::npos) {
-            size_t startQuote = idPos + 4;
-            size_t endQuote = content.find('"', startQuote);
-            if (endQuote != std::string::npos) {
-                geometryId = content.substr(startQuote, endQuote - startQuote);
-                //std::cout << "geometry id: " << geometryId << std::endl;
-            }
-        }
-
-        // find next <triangles inside geometry
-        size_t triStart = content.find("<triangles", geoStart);
-        size_t lineStart = content.rfind('\n', triStart);
-        if (lineStart == std::string::npos) lineStart = 0;
-        else lineStart++; // move past the '\n'
-        triStart = lineStart;
-
-        // fetch the updated triangles block after erase
-        size_t triEnd = content.find("</triangles>", triStart);
-        if (triEnd == std::string::npos) break;
-        triEnd += strlen("</triangles>"); // include closing tag
-
-        // get material count for this mesh
-        size_t matCount = allMaterialToIndices[meshIdx].size();
-        // skip duplicating if only 1 mat
-        if (matCount <= 1) { // debug change number to high to skip all
-            filePos = triEnd; // move forward past this triangles block so next loop can find next geometry
-            continue;
-        }
-
-        // yeet p line but keep entering <p> tag
-        size_t pStart = content.find("<p>", triStart);
-        if (pStart != std::string::npos) {
-            size_t pEnd = content.find("</p>", pStart);
-            if (pEnd != std::string::npos) {
-                // erase from just after <p> (pStart + 3) to after </p> (pEnd + 4)
-                content.erase(pStart + 3, (pEnd + 4) - (pStart + 3));
-            }
-        }
-
-        triEnd = content.find("</triangles>", triStart);
-        if (triEnd == std::string::npos) break;
-        triEnd += strlen("</triangles>");
-        filePos = triEnd;
-
-        std::string triBlock = content.substr(triStart, triEnd - triStart);
-
-        // prepare new triangles blocks concatenated
-        std::string newTrianglesBlocks;
-
-        for (size_t matIdx = 0; matIdx < matCount; matIdx++) {
-            std::string duplicatedBlock = triBlock;
-
-            // print material index to console
-            //std::cout << "mesh " << meshIdx << " material index: " << allMaterialToIndices[meshIdx][matIdx].first << std::endl;
-
-            // replace count attribute in <triangles> tag
-            size_t countPos = duplicatedBlock.find("count=");
-            if (countPos != std::string::npos) {
-                size_t quoteStart = duplicatedBlock.find('"', countPos);
-                size_t quoteEnd = duplicatedBlock.find('"', quoteStart + 1);
-                if (quoteStart != std::string::npos && quoteEnd != std::string::npos)
-                    duplicatedBlock.replace(quoteStart + 1, quoteEnd - quoteStart - 1, std::to_string(allMaterialToIndices[meshIdx][matIdx].second.size() / 3));
-            }
-            // replace material attribute in <triangles> tag
-            size_t matAttrPos = duplicatedBlock.find("material=");
-            if (matAttrPos != std::string::npos) {
-                size_t quoteStart = duplicatedBlock.find('"', matAttrPos);
-                size_t quoteEnd = duplicatedBlock.find('"', quoteStart + 1);
-                if (quoteStart != std::string::npos && quoteEnd != std::string::npos)
-                    duplicatedBlock.replace(quoteStart + 1, quoteEnd - quoteStart - 1, "defaultMaterial" + std::to_string(allMaterialToIndices[meshIdx][matIdx].first));
-            }
-
-			// add data after <p> tag with indices for this material
-            size_t pPos = duplicatedBlock.find("<p>");
-            if (pPos != std::string::npos) {
-                pPos += 3; // after "<p>"
-
-                std::string indicesStr;
-                for (auto idx : allMaterialToIndices[meshIdx][matIdx].second)
-                    indicesStr += std::to_string(idx) + " ";
-                if (!indicesStr.empty()) indicesStr.pop_back(); // trim trailing space
-
-                duplicatedBlock.insert(pPos, indicesStr + "</p>");
-            }
-
-            newTrianglesBlocks += duplicatedBlock;
-            if (matIdx != matCount - 1) newTrianglesBlocks += "\n"; // add newline between blocks except last
-
-            processedMats++;
-        }
-
-        // replace original triangles block with new concatenated ones
-        content.replace(triStart, triEnd - triStart, newTrianglesBlocks);
-
-        // update filePos so next search starts after the new blocks
-        filePos = triStart + newTrianglesBlocks.length();
-
-		// find instance_geometry line and patch it with extra material
-        size_t searchPos = filePos;
-        std::string searchStr = "url=\"#" + geometryId + "-skin\"";
-        while (true) {
-            size_t instancePos = content.find("<instance_controller", searchPos);
-            if (instancePos == std::string::npos) break;
-
-            size_t lineStart = content.rfind('\n', instancePos);
-            if (lineStart == std::string::npos) lineStart = 0; else lineStart++;
-            size_t lineEnd = content.find('\n', instancePos);
-            if (lineEnd == std::string::npos) lineEnd = content.length();
-
-            std::string line = content.substr(lineStart, lineEnd - lineStart);
-
-            if (line.find(searchStr) != std::string::npos) {
-                //std::cout << "Found instance_controller line: " << line << std::endl;
-                searchPos = instancePos;
-                break;
-            }
-            searchPos = lineEnd + 1; // move past this line for next search
-        }
-
-		// do the instance_material block duplication after finding the right instance_controller
-        size_t matStart = content.find("<instance_material", searchPos);
-        if (matStart == std::string::npos) {
-            std::cerr << "no instance_material found after instance_controller\n";
-        }
-        else {
-            size_t matEnd = content.find("</instance_material>", matStart);
-
-            matEnd += strlen("</instance_material>");
-            size_t lineStart = content.rfind('\n', matStart);
-            if (lineStart == std::string::npos) lineStart = 0; else lineStart++; // move past newline
-            std::string instanceMaterialBlock = content.substr(lineStart, matEnd - lineStart);
-
-            // duplicate instance_material blocks per material
-            std::string newInstanceMaterials;
-            for (size_t matIdx = 0; matIdx < matCount; matIdx++) {
-                std::string block = instanceMaterialBlock;
-
-                size_t symPos = block.find("symbol=");
-                if (symPos != std::string::npos) {
-                    size_t qStart = block.find('"', symPos);
-                    size_t qEnd = block.find('"', qStart + 1);
-                    if (qStart != std::string::npos && qEnd != std::string::npos)
-                        block.replace(qStart + 1, qEnd - qStart - 1, "defaultMaterial" + std::to_string(allMaterialToIndices[meshIdx][matIdx].first));
-                }
-
-                size_t tgtPos = block.find("target=");
-                if (tgtPos != std::string::npos) {
-                    size_t qStart = block.find('"', tgtPos);
-                    size_t qEnd = block.find('"', qStart + 1);
-                    if (qStart != std::string::npos && qEnd != std::string::npos)
-                        block.replace(qStart + 1, qEnd - qStart - 1, "#material_" + std::to_string(allMaterialToIndices[meshIdx][matIdx].first));
-                }
-
-                newInstanceMaterials += block;
-                if (matIdx != matCount - 1) newInstanceMaterials += "\n";
-            }
-
-            // replace original instance_material block with the new ones
-            content.replace(lineStart, matEnd - lineStart, newInstanceMaterials);
-        }
-        std::cout << "Fixed mesh " << (geometryId.size() > 2 && geometryId.compare(geometryId.size() - 2, 2, "_1") == 0 ? geometryId.substr(0, geometryId.size() - 2) : geometryId) << " to have " << processedMats - 1 << " extra mat(s)" << std::endl;
-    }
-
-    // write patched file back
-    std::ofstream out(filePath);
-    if (out.is_open()) {
-        out << content;
-        out.close();
-    }
+    file.close();
 }
 
-void GetDaeNormals(const std::string& outFile) {
-    std::ifstream dae(outFile.c_str());
-    if (!dae.is_open()) {
-        std::cerr << "couldn't open dae file\n";
+typedef void(__cdecl* PatchDaeFileFunc)(const char*, const char*);
+void CallPatchDaeFileDLL(const std::string& outFile, const std::vector<std::vector<std::pair<unsigned int, std::vector<unsigned int>>>>& allMaterialToIndices) {
+    std::string tempPath = "allmatinfo.txt";
+    SerializeAllMatToIndices(tempPath, allMaterialToIndices);
+
+    HMODULE dll = LoadLibraryA("tinyxml2patcher.dll");
+    if (!dll) {
+        std::cerr << "Failed to load tinyxml2patcher.dll" << std::endl;
+        return;
+    }
+    PatchDaeFileFunc patchFunc = (PatchDaeFileFunc)GetProcAddress(dll, "PatchDaeFile_C");
+    if (!patchFunc) {
+        std::cerr << "Failed to find PatchDaeFile_C in DLL" << std::endl;
+        FreeLibrary(dll);
+        return;
+    }
+    patchFunc(outFile.c_str(), tempPath.c_str());
+    std::remove(tempPath.c_str());
+    FreeLibrary(dll);
+}
+
+typedef void(__cdecl* GetNormalsFunc)(const char*);
+void CallGetNormalsFromDLL(const std::string& daePath) {
+    HMODULE dll = LoadLibraryA("tinyxml2patcher.dll");
+    if (!dll) {
+        std::cerr << "couldn't load tinyxml2patcher.dll\n";
         return;
     }
 
-    std::string line;
-    std::vector<std::pair<std::string, std::vector<Vec3> > > meshNormals;
-    std::string currentMesh;
-    std::vector<float> currentNormals;
-
-    while (std::getline(dae, line)) {
-        if (line.find("<geometry") != std::string::npos && line.find("name=\"") != std::string::npos) {
-            size_t nameStart = line.find("name=\"") + 6;
-            size_t nameEnd = line.find("\"", nameStart);
-            if (nameEnd != std::string::npos) {
-                std::string rawName = line.substr(nameStart, nameEnd - nameStart);
-                for (size_t i = 0; i < rawName.size(); ++i) {
-                    if (rawName[i] == '.')
-                        rawName.replace(i, 1, "FBXASC046"), i += sizeof("FBXASC046") - 2;
-                }
-                currentMesh = rawName + "Shape";
-                currentNormals.clear();
-                //std::cout << "Retrieved name: " << currentMesh << "\n";
-            }
-        }
-        else {
-            std::string lowerLine = line;
-            std::transform(lowerLine.begin(), lowerLine.end(), lowerLine.begin(), ::tolower);
-
-            if (!currentMesh.empty() && lowerLine.find("<float_array") != std::string::npos && lowerLine.find("normal") != std::string::npos) {
-                std::string floatData;
-
-                size_t gtPos = line.find('>');
-                if (gtPos != std::string::npos)
-                    floatData += line.substr(gtPos + 1);
-
-                while (line.find("</float_array>") == std::string::npos && std::getline(dae, line))
-                    floatData += " " + line;
-
-                size_t ltPos = floatData.find('<');
-                if (ltPos != std::string::npos)
-                    floatData = floatData.substr(0, ltPos);
-
-                std::istringstream iss(floatData);
-                float f;
-                currentNormals.clear();
-                while (iss >> f)
-                    currentNormals.push_back(f);
-
-                std::vector<Vec3> vecs;
-                for (size_t i = 0; i + 2 < currentNormals.size(); i += 3)
-                    vecs.push_back(Vec3{ currentNormals[i], currentNormals[i + 1], currentNormals[i + 2] });
-
-                meshNormals.push_back(std::make_pair(currentMesh, vecs));
-                currentMesh.clear();
-            }
-        }
-    }
-
-    dae.close();
-
-    std::string outputName = outFile.substr(0, outFile.find_last_of('.')) + "_normals.txt";
-    std::ofstream py(outputName.c_str());
-    if (!py.is_open()) {
-        std::cerr << "couldn't write normals txt file\n";
+    GetNormalsFunc func = (GetNormalsFunc)GetProcAddress(dll, "GetDaeNormals_C");
+    if (!func) {
+        std::cerr << "couldn't find GetDaeNormals_C\n";
+        FreeLibrary(dll);
         return;
     }
 
-    py << "import maya.cmds as cmds\n\n";
-
-    for (size_t i = 0; i < meshNormals.size(); ++i) {
-        const std::string& mesh = meshNormals[i].first;
-        const std::vector<Vec3>& normals = meshNormals[i].second;
-
-        py << "mesh = \"" << mesh << "\"\n";
-        py << "normals = [";
-        for (size_t j = 0; j < normals.size(); ++j) {
-            const Vec3& n = normals[j];
-            py << "(" << n.x << "," << n.y << "," << n.z << ")";
-            if (j + 1 < normals.size()) py << ",";
-        }
-        py << "]\n";
-        py << "for i, (x, y, z) in enumerate(normals):\n";
-        py << "    cmds.polyNormalPerVertex(f\"{mesh}.vtx[{i}]\", xyz=(x, y, z))\n\n";
-    }
-    // write joint resizing to have a better radius cus may aswell
-    py << "# resize all joints radius\n";
-    py << "joints = cmds.ls(type='joint')\n";
-    py << "for j in joints:\n";
-    py << "    if cmds.attributeQuery('radius', node=j, exists=True):\n";
-    py << "        cmds.setAttr(f\"{j}.radius\", 0.3)";
-
-    py.close();
-
-    std::cout << "\nMaya py script to import normals after dae import: " << outputName << " <- run that in script editor!\n";
+    func(daePath.c_str());
+    FreeLibrary(dll);
 }
 
 void RenameNode(uint32_t root, uint32_t current, std::vector<NodeNames>& allNodeNames, const std::vector<FullNodeData>& fullNodeDataList)
@@ -424,6 +139,158 @@ aiMatrix4x4 GetOffsetMatrix(aiNode* boneNode, aiNode* meshNode) {
         meshTransform = p->mTransformation * meshTransform;
 
     return boneTransform.Inverse() * meshTransform;
+}
+
+// stuff for writing preset file for imports
+
+bool floatsEqual(float a, float b, float epsilon = 1e-5f) {
+    return std::abs(a - b) < epsilon;
+}
+
+bool vecEquals(const std::vector<float>& v, const float* def, size_t count, float epsilon = 1e-5f) {
+    if (v.size() < count) return false;
+    for (size_t i = 0; i < count; ++i) {
+        if (!floatsEqual(v[i], def[i], epsilon)) return false;
+    }
+    return true;
+}
+
+int WritePresetFile(const std::string& path, const std::vector<Material>& materialsData,
+    const std::vector<TextureName>& textureNames, const std::vector<NodeNames>& allNodeNames,
+    const std::vector<FullNodeData>& fullNodeDataList)
+{
+    std::ofstream out(path);
+    if (!out) {
+        std::cerr << "failed to open " << path << " for writing\n";
+        return 1;
+    }
+
+    MaterialPreset def;
+
+    for (size_t i = 0; i < materialsData.size(); ++i) {
+        const Material& m = materialsData[i];
+        MaterialPreset def;
+
+        bool printedHeader = false;
+
+        auto printHeader = [&]() {
+            if (!printedHeader) {
+                if (i != 0) out << "\n";
+                out << "#Material\n";
+                printedHeader = true;
+            }
+            };
+
+        bool diffDiffuse = false;
+        for (int j = 0; j < 4; ++j)
+            if (!floatsEqual(m.Diffuse[j], def.diffuse[j])) diffDiffuse = true;
+
+        bool diffSpecular = false;
+        for (int j = 0; j < 4; ++j)
+            if (!floatsEqual(m.Specular[j], def.specular[j])) diffSpecular = true;
+
+        bool diffAmbience = false;
+        for (int j = 0; j < 4; ++j)
+            if (!floatsEqual(m.Ambience[j], def.ambience[j])) diffAmbience = true;
+
+        bool diffShiny = !floatsEqual(m.Shiny, def.shiny);
+
+        bool diffUnknown0 = (!m.Unknowns.empty() && m.Unknowns[0] != def.unknownVal);
+
+        bool diffUnknown2 = (m.Unknowns2.size() > 3) && !floatsEqual(m.Unknowns2[3], def.unknownVal2);
+
+        bool diffTexAlbedo = (m.TextureIndices.size() > 0 && m.TextureIndices[0] != def.texAlbedo);
+        bool diffTexSpecular = (m.TextureIndices.size() > 1 && m.TextureIndices[1] != def.texSpecular);
+        bool diffTexReflective = (m.TextureIndices.size() > 2 && m.TextureIndices[2] != def.texReflective);
+        bool diffTexEnvironment = (m.TextureIndices.size() > 3 && m.TextureIndices[3] != def.texEnvironment);
+        bool diffTexNormal = (m.TextureIndices.size() > 4 && m.TextureIndices[4] != def.texNormal);
+
+        if (diffDiffuse) {
+            printHeader();
+            out << "#DIFFUSE " << m.Diffuse[0] << " " << m.Diffuse[1] << " " << m.Diffuse[2] << " " << m.Diffuse[3] << "\n";
+        }
+        if (diffSpecular) {
+            printHeader();
+            out << "#SPECULAR " << m.Specular[0] << " " << m.Specular[1] << " " << m.Specular[2] << " " << m.Specular[3] << "\n";
+        }
+        if (diffAmbience) {
+            printHeader();
+            out << "#AMBIENCE " << m.Ambience[0] << " " << m.Ambience[1] << " " << m.Ambience[2] << " " << m.Ambience[3] << "\n";
+        }
+        if (diffShiny) {
+            printHeader();
+            out << "#SHINY " << m.Shiny << "\n";
+        }
+        if (diffTexAlbedo && m.TextureIndices[0] != -1) {
+            printHeader();
+            out << "#TEXALBEDO " << m.TextureIndices[0] << "\n";
+        }
+        if (diffTexSpecular && m.TextureIndices[1] != -1) {
+            printHeader();
+            out << "#TEXSPECULAR " << m.TextureIndices[1] << "\n";
+        }
+        if (diffTexReflective && m.TextureIndices[2] != -1) {
+            printHeader();
+            out << "#TEXREFLECTIVE " << m.TextureIndices[2] << "\n";
+        }
+        if (diffTexEnvironment && m.TextureIndices[3] != -1) {
+            printHeader();
+            out << "#TEXENVIRONMENT " << m.TextureIndices[3] << "\n";
+        }
+        if (diffTexNormal && m.TextureIndices[4] != -1) {
+            printHeader();
+            out << "#TEXNORMAL " << m.TextureIndices[4] << "\n";
+        }
+        if (diffUnknown0) {
+            printHeader();
+            out << "#UNKNOWN " << m.Unknowns[0] << "\n";
+        }
+        if (diffUnknown2) {
+            printHeader();
+            out << "#UNKNOWN2 " << m.Unknowns2[3] << "\n";
+        }
+    }
+
+    bool wroteAnimFloats = false;
+    for (size_t i = 0; i < fullNodeDataList.size(); ++i) {
+        const BoneData& b = fullNodeDataList[i].boneData;
+        bool hasAnimData = false;
+        for (int j = 0; j < 6; ++j) {
+            if (b.AnimationVals[j] != 0.0f) {
+                hasAnimData = true;
+                break;
+            }
+        }
+        if (hasAnimData) {
+            if (!wroteAnimFloats) {
+                out << "\n";
+                wroteAnimFloats = true;
+            }
+            out << "#AnimFloats " << allNodeNames[i].Name << " "
+                << b.AnimationVals[0] << " " << b.AnimationVals[1] << " " << b.AnimationVals[2] << " "
+                << b.AnimationVals[3] << " " << b.AnimationVals[4] << " " << b.AnimationVals[5] << "\n";
+        }
+    }
+
+    if (!textureNames.empty()) {
+        out << "\n#Textures\n";
+        for (size_t i = 0; i < textureNames.size(); ++i) {
+            out << textureNames[i].Name << "\n";
+        }
+    }
+
+    if (!allNodeNames.empty() && allNodeNames.size() == fullNodeDataList.size()) {
+        out << "\n#Meshes\n";
+        for (size_t i = 0; i < fullNodeDataList.size(); ++i) {
+            if (!fullNodeDataList[i].subMeshes.empty()) {
+                out << allNodeNames[i].Name << "\n";
+            }
+        }
+    }
+
+    std::cout << std::endl << "Written material/extra data preset to " << path << "\nUse this for importing!" << std::endl;
+
+    return 0;
 }
 
 void SaveDaeFile(const std::string& path, Header& headerData, std::vector<Material>& materialsData, std::vector<TextureName>& textureNames,
@@ -799,72 +666,66 @@ void SaveDaeFile(const std::string& path, Header& headerData, std::vector<Materi
             aiMesh* mesh = scene->mMeshes[mergeSubmeshes ? parentNode->mMeshes[0] : meshBase + m];
             std::map<uint32_t, std::vector<aiVertexWeight>> boneWeightsMap;
 
-            if (linkIt != nodeLinks.end()) {
-                size_t start = mergeSubmeshes ? 0 : m;
-                size_t end = mergeSubmeshes ? subCount : m + 1;
+            for (size_t s = (mergeSubmeshes ? 0 : m); s < (mergeSubmeshes ? subCount : m + 1); ++s) {
+                const auto& sub = nodeData.subMeshes[s];
+                if (!sub.SkinnedBonesCount) { vertexOffset += sub.VertexCount; continue; }
 
-                for (size_t s = start; s < end; s++) {
-                    const auto& sub = nodeData.subMeshes[s];
-                    if (!sub.SkinnedBonesCount) { vertexOffset += sub.VertexCount; continue; }
+                uint32_t mask = sub.BonesIndexMask;
+                std::vector<uint32_t> filtered;
+                for (uint32_t i = 0; i < linkIt->BoneOffsets.size(); ++i)
+                    if (mask & (1 << i)) filtered.push_back(linkIt->BoneOffsets[i]);
 
-                    uint32_t mask = sub.BonesIndexMask;
-                    std::vector<uint32_t> filtered;
-                    for (uint32_t i = 0; i < linkIt->BoneOffsets.size(); ++i)
-                        if (mask & (1 << i)) filtered.push_back(linkIt->BoneOffsets[i]);
-
-                    size_t vertexCount = sub.VertexCount;
-                    const auto& weightsFlat = nodeData.weightsList[s];
-                    for (size_t b = 0; b < filtered.size(); b++) {
-                        uint32_t boneNodeIndex = filtered[b];
-                        for (size_t v = 0; v < vertexCount; v++) {
-                            float weight = weightsFlat[b * vertexCount + v];
-                            if (weight > 0.0f)
-                                boneWeightsMap[boneNodeIndex].push_back(aiVertexWeight(static_cast<unsigned int>((mergeSubmeshes ? vertexOffset : 0) + v), weight));
-                        }
+                size_t vertexCount = sub.VertexCount;
+                const auto& weightsFlat = nodeData.weightsList[s];
+                for (size_t b = 0; b < filtered.size(); b++) {
+                    uint32_t boneNodeIndex = filtered[b];
+                    for (size_t v = 0; v < vertexCount; v++) {
+                        float weight = weightsFlat[b * vertexCount + v];
+                        if (weight > 0.0f)
+                            boneWeightsMap[boneNodeIndex].push_back(aiVertexWeight(static_cast<unsigned int>((mergeSubmeshes ? vertexOffset : 0) + v), weight));
                     }
-                    vertexOffset += vertexCount;
+                }
+
+                vertexOffset += vertexCount;
+            }
+
+            // collect all filtered bones first, keep order, even if they have 0 weights
+            std::vector<uint32_t> orderedBones;
+            std::unordered_set<uint32_t> written;
+            if (linkIt != nodeLinks.end()) { // if this mesh has node links run this, else skip and just add the 0 weight extras
+                for (uint32_t boneIdx : linkIt->BoneOffsets) {
+                    if (written.insert(boneIdx).second)
+                        orderedBones.push_back(boneIdx);
                 }
             }
 
-            // bones with actual influence first
-            std::vector<uint32_t> weightedBones;
-            std::vector<uint32_t> unweightedBones;
-
+            // add all other nodes (excluding mesh holders) that weren't already added
             for (const auto& kv : nodeMap) {
                 uint32_t nodeIdx = kv.first;
-                if (kv.second->mNumMeshes > 0) continue;
-
-                if (boneWeightsMap.count(nodeIdx))
-                    weightedBones.push_back(nodeIdx);
-                else
-                    unweightedBones.push_back(nodeIdx);
+                if (kv.second->mNumMeshes > 0 || written.count(nodeIdx)) continue;
+                orderedBones.push_back(nodeIdx);
             }
 
-            mesh->mNumBones = static_cast<unsigned int>(weightedBones.size() + unweightedBones.size());
+            // allocate bones
+            mesh->mNumBones = static_cast<unsigned int>(orderedBones.size());
             mesh->mBones = new aiBone * [mesh->mNumBones];
             size_t boneIdx = 0;
 
-            // first write bones that actually influence
-            for (uint32_t nodeIdx : weightedBones) {
+            for (uint32_t nodeIdx : orderedBones) {
                 aiBone* bone = new aiBone();
                 bone->mName = aiString(allNodeNames[nodeIdx].Name.c_str());
                 bone->mOffsetMatrix = GetOffsetMatrix(nodeMap[nodeIdx], parentNode);
 
-                const auto& weights = boneWeightsMap[nodeIdx];
-                bone->mNumWeights = static_cast<unsigned int>(weights.size());
-                bone->mWeights = new aiVertexWeight[weights.size()];
-                std::copy(weights.begin(), weights.end(), bone->mWeights);
-
-                mesh->mBones[boneIdx++] = bone;
-            }
-
-            // then write zero-weight bones after
-            for (uint32_t nodeIdx : unweightedBones) {
-                aiBone* bone = new aiBone();
-                bone->mName = aiString(allNodeNames[nodeIdx].Name.c_str());
-                bone->mOffsetMatrix = GetOffsetMatrix(nodeMap[nodeIdx], parentNode);
-                bone->mNumWeights = 0;
-                bone->mWeights = nullptr;
+                const auto it = boneWeightsMap.find(nodeIdx);
+                if (it != boneWeightsMap.end()) {
+                    bone->mNumWeights = static_cast<unsigned int>(it->second.size());
+                    bone->mWeights = new aiVertexWeight[it->second.size()];
+                    std::copy(it->second.begin(), it->second.end(), bone->mWeights);
+                }
+                else {
+                    bone->mNumWeights = 0;
+                    bone->mWeights = nullptr;
+                }
 
                 mesh->mBones[boneIdx++] = bone;
             }
@@ -883,14 +744,25 @@ void SaveDaeFile(const std::string& path, Header& headerData, std::vector<Materi
 
     std::cout << std::endl << "Writing..." << std::endl;
 
-    // export
-    std::string outFile = path.substr(0, path.find_last_of('.')) + "_out.dae";
+    WritePresetFile(([](const std::string& p) {
+        auto f = p.substr(p.find_last_of("/\\") + 1);
+        f = f.substr(0, f.find_last_of('.') == std::string::npos ? f.size() : f.find_last_of('.'));
+        f = f.substr(0, f.find('_') == std::string::npos ? f.size() : f.find('_'));
+        if (!f.empty()) f[0] = (char)toupper(f[0]);
+        return f + "Preset.txt";
+        })(path), materialsData, textureNames, allNodeNames, fullNodeDataList);
+
+
     Assimp::Exporter exporter;
-    aiReturn rc = exporter.Export(scene, "collada", outFile);
-    PatchDaeFile(outFile, allMaterialToIndices);
-    if (mergeSubmeshes) {
-        GetDaeNormals(outFile);
+    std::string outFile = path.substr(0, path.find_last_of('.')) + "_out.dae";
+    aiReturn rc;
+    {
+        Assimp::Exporter exporter;
+        rc = exporter.Export(scene, "collada", outFile);
     }
+
+    CallPatchDaeFileDLL(outFile, allMaterialToIndices);
+    CallGetNormalsFromDLL(outFile);
     std::cout << std::endl << "Saved file as " << outFile << std::endl;
 }
 
@@ -941,8 +813,8 @@ void SaveMKDXFile(const std::string& path, Header& header, std::vector<Material>
     {
         for (uint32_t f : mat.Unknowns)
             writer.write(reinterpret_cast<char*>(&f), sizeof(uint32_t));
-        for (float f : mat.UnknownValues)
-            writer.write(reinterpret_cast<char*>(&f), sizeof(float));
+        for (uint32_t f : mat.UnknownValues)
+            writer.write(reinterpret_cast<char*>(&f), sizeof(uint32_t));
         for (float f : mat.Diffuse)
             writer.write(reinterpret_cast<char*>(&f), sizeof(float));
         for (float f : mat.Specular)
@@ -1140,11 +1012,12 @@ void SaveMKDXFile(const std::string& path, Header& header, std::vector<Material>
         for (float f : bone.Scale) writer.write((char*)&f, sizeof(float));
         for (float f : bone.Rotation) writer.write((char*)&f, sizeof(float));
         for (float f : bone.Translation) writer.write((char*)&f, sizeof(float));
-        for (uint32_t u : bone.BoundingBox) writer.write((char*)&u, sizeof(uint32_t));
+        for (float u : bone.BoundingBox) writer.write((char*)&u, sizeof(float));
         writer.write((char*)&bone.ModelObjectArrayOffset, sizeof(uint32_t));
         writer.write((char*)&bone.ChildrenArrayOffset, sizeof(uint32_t));
         for (float f : bone.MoreFloats) writer.write((char*)&f, sizeof(float));
-        for (uint32_t u : bone.Unknowns2) writer.write((char*)&u, sizeof(uint32_t));
+        for (float u : bone.AnimationVals) writer.write((char*)&u, sizeof(float));
+        for (float u : bone.BoundingBoxMaxMin) writer.write((char*)&u, sizeof(float));
         uint32_t pad = 0;
         writer.write((char*)&pad, sizeof(uint32_t)); // pad
 
@@ -1256,5 +1129,5 @@ void SaveMKDXFile(const std::string& path, Header& header, std::vector<Material>
     }
 
     writer.close();
-    std::cout << "\nSaved binary MKDX file as " << outFile << std::endl << "NO THIS WONT WORK IT'LL WORK NEXT UPDATE" << std::endl;
+    std::cout << "\nSaved binary MKDX file as " << outFile << std::endl;
 }

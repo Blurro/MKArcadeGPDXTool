@@ -12,9 +12,26 @@ I'm antsy waiting for the Switch 2 to be hacked so I can dive right into making 
 ## Usage
 
 *Extracting* Just drag and drop any Arcade GP DX .bin file onto the tool (in file explorer, not after opening)
+- If you plan to make a mod, make sure to add the 'n' argument for No merging of meshes!
+- If importing a tool export into Maya, you may find Maya likes to skip importing normals to skinned meshes - use the maya python script created next to the .dae to fix!
 
-*Importing* Just... wait for it to be done it aint here yet
+*Importing* Modify an existing .dae export in Maya or Blender and modify it, export .dae, drag and drop your .dae onto the tool.
+- MESHES MUST BE SPLIT TO HAVE MAX 6 BONE INFLUENCES (>6 assigned is fine but having >6 assigned bones with non-zero weights is not allowed)
+- MESHES MUST BE SPLIT BY MATERIAL TOO (only 1 mat/tex per mesh)
+- Split meshes become submeshes, guide below on how to pair them to their main mesh
+- For minimal errors, keep original names of everything! Animation editing coming next, this might allow custom mesh and bone names, unsure atm
+- Maya imports will turn '.' into 'FBXASC045', don't change this, the tool will still recognise this as a period
+- Modify the (character)Preset.txt file to add/modify materials and other values not handled by a .dae file
+
+**Submeshes in Maya:** All child meshes of a mesh will be treated as submeshes of that parent mesh - unless the mesh is listed in (character)Preset.txt file.
+Child submeshes can be named anything (these names will not be saved in the game file), just ensure all 'main' meshes are listed in your preset txt.
+
+*Blender cannot have meshes be children of bones so it works differently*
+**Submeshes in Blender:** All submeshes are named the same as their main mesh + with suffix ".xxx" (a period followed by 3 digits), & are also siblings to their main mesh.
+All main meshes must be listed in preset txt so submeshes can be found and treated as such.
+
+*If submesh explanation doesn't make sense, just export some characters with the 'n' arg and open in these 3D programs to see how submeshes work*
 
 This is my first time making a tool for an overlooked model format like this and I've definitely learned some things. First custom character on its way!
 
-I've only tested on my own PC/OS and people quite often (rip) have problems with my tools that I don't run into so please contact me on Discord @blurro if you have any issues or suggestions!
+I've only tested on my own PC/OS and people quite often (rip) have problems with my tools that I don't run into so please contact me on Discord @blurro if you have any issues or suggestions! 3

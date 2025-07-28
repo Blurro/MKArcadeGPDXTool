@@ -20,7 +20,7 @@ struct Header {
 };
 
 struct Material {
-    std::vector<uint32_t> Unknowns = { 0, 1, 1029, 0, 513, 0 };
+    std::vector<uint32_t> Unknowns = { 64, 1, 1029, 0, 513, 0 };
     std::vector<uint32_t> UnknownValues = { 0, 1, 0, 65793 };
     std::vector<float> Diffuse = std::vector<float>(4, 0.f);
     std::vector<float> Specular = std::vector<float>(4, 0.f);
@@ -37,11 +37,12 @@ struct BoneData {
     std::vector<float> Scale = std::vector<float>(3, 1.f);
     std::vector<float> Rotation = std::vector<float>(3, 0.f);
     std::vector<float> Translation = std::vector<float>(3, 0.f);
-    std::vector<uint32_t> BoundingBox = std::vector<uint32_t>(4, 0); // xyz centre then radius
+    std::vector<float> BoundingBox = std::vector<float>(4, 0); // xyz centre then radius
     uint32_t ModelObjectArrayOffset = 0;
     uint32_t ChildrenArrayOffset = 0;
     std::vector<float> MoreFloats = std::vector<float>(3, 1.f);
-    std::vector<uint32_t> Unknowns2 = std::vector<uint32_t>(12, 0); // first 6 are 0s next 6 are bounding box xyz max and xyz min
+    std::vector<float> AnimationVals = std::vector<float>(6, 0);
+    std::vector<float> BoundingBoxMaxMin = std::vector<float>(6, 0); // first 6 are 0s next 6 are bounding box xyz max and xyz min
 };
 
 struct SubMesh {
@@ -95,11 +96,23 @@ struct NodeLinks {
     std::vector<uint32_t> BoneOffsets;
 };
 
+struct MKDXData {
+    Header headerData;
+    std::vector<Material> materialsData;
+    std::vector<TextureName> textureNames;
+    std::vector<NodeLinks> nodeLinks;
+    std::vector<NodeNames> allNodeNames;
+    std::vector<uint32_t> rootNodes;
+    std::vector<FullNodeData> fullNodeDataList;
+	std::vector<NodeNames> boneNames;
+};
+
 struct Vec3 {
     float x, y, z;
 };
 
 struct MaterialPreset {
+    int unknownVal = 64;
     float diffuse[4] = { 0.5f, 0.5f, 0.5f, 1.0f };
     float specular[4] = { 0.7f, 0.7f, 0.7f, 1.0f };
     float ambience[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
@@ -109,4 +122,5 @@ struct MaterialPreset {
     int texReflective = -1;
     int texEnvironment = -1;
     int texNormal = -1;
+    float unknownVal2 = 50.f;
 };

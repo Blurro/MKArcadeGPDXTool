@@ -1,0 +1,22 @@
+//material 1, this is Mario's
+#Material
+#DIFFUSE 0.5 0.5 0.5 1
+#SPECULAR 0.7 0.7 0.7 1
+#AMBIENCE 1 1 1 1
+#SHINY 1
+#TEXALBEDO 0
+#TEXSPECULAR 1
+#TEXREFLECTIVE -1
+#TEXENVIRONMENT -1
+#TEXNORMAL -1
+
+//next material starts with the same tag, make sure the amount of '#Material's matches the .dae file!
+//anything not stated will use default values (same values as above, but any undefined '#TEX' is defaulted to '-1')
+#Material
+#TEXALBEDO 2
+
+//only have one '#Textures', all following lines will be the textures the file references
+#Textures
+mario_body01_col.dds
+mario_body01_spe.dds
+material_2_albedo_example.dds

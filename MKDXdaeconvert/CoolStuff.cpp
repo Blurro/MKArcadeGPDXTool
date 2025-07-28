@@ -1,4 +1,4 @@
-#include <assimp/scene.h>
+﻿#include <assimp/scene.h>
 #include <assimp/Exporter.hpp>
 #include <assimp/mesh.h>
 #include <assimp/anim.h>
@@ -14,6 +14,8 @@
 #include <windows.h>
 #include <sstream>
 #include <set>
+#include <unordered_map>
+#include <array>
 
 #define _CRT_SECURE_NO_WARNINGS
 // my headers
@@ -89,6 +91,23 @@ inline std::vector<float> ReadFloats(std::istream& stream, size_t count) {
     return arr;
 }
 
+void collectWorldVerts(aiNode* node, const aiScene* scene, const aiMatrix4x4& parentTransform, std::vector<aiVector3D>& vertsOut) {
+    aiMatrix4x4 localTransform = parentTransform * node->mTransformation;
+
+    for (unsigned int m = 0; m < node->mNumMeshes; ++m) {
+        const aiMesh* mesh = scene->mMeshes[node->mMeshes[m]];
+        for (unsigned int v = 0; v < mesh->mNumVertices; ++v) {
+            aiVector3D vtx = mesh->mVertices[v];
+            vtx *= localTransform;
+            vertsOut.push_back(vtx);
+        }
+    }
+
+    for (unsigned int c = 0; c < node->mNumChildren; ++c) {
+        collectWorldVerts(node->mChildren[c], scene, localTransform, vertsOut);
+    }
+}
+
 std::string ReadCStringAtOffset(std::istream& stream, uint32_t pointer) {
     auto currentPos = stream.tellg();
     stream.seekg(pointer, std::ios::beg);
@@ -120,6 +139,101 @@ std::vector<float> QuaternionToEulerXYZ(const aiQuaterniont<float>& q) {
     float yaw = std::atan2(siny_cosp, cosy_cosp);
 
     return { roll, pitch, yaw }; // in radians
+}
+
+std::string CloneAndFixFBXASC(const std::string& originalPath) {
+    std::ifstream in(originalPath);
+    if (!in) {
+        std::cerr << "failed to open dae for fix: " << originalPath << "\n";
+        return "";
+    }
+
+    std::stringstream buffer;
+    buffer << in.rdbuf();
+    std::string content = buffer.str();
+    in.close();
+
+    size_t pos = 0;
+    const std::string needle = "FBXASC046";
+    const std::string dot = ".";
+
+    while ((pos = content.find(needle, pos)) != std::string::npos)
+        content.replace(pos, needle.length(), dot);
+
+    std::string tempPath = originalPath + "tmp";
+    std::ofstream out(tempPath);
+    if (!out) {
+        std::cerr << "failed to write tmp dae\n";
+        return "";
+    }
+    out << content;
+    out.close();
+
+    return tempPath;
+}
+
+typedef void(__cdecl* NodeToSubmeshFunc)(const char*, const char** meshList, int meshCount);
+void CallNodeToSubmeshFromDLL(const std::string& daePath, const std::vector<std::string>& meshList) {
+    HMODULE dll = LoadLibraryA("tinyxml2patcher.dll");
+    if (!dll) {
+        std::cerr << "couldn't load tinyxml2patcher.dll\n";
+        return;
+    }
+
+    NodeToSubmeshFunc func = (NodeToSubmeshFunc)GetProcAddress(dll, "NodeToSubmesh_C");
+    if (!func) {
+        std::cerr << "couldn't find NodeToSubmesh_C\n";
+        FreeLibrary(dll);
+        return;
+    }
+
+    std::vector<const char*> meshNamesCStr;
+    for (const std::string& meshName : meshList)
+        meshNamesCStr.push_back(meshName.c_str());
+
+    func(daePath.c_str(), meshNamesCStr.data(), (int)meshNamesCStr.size());
+
+    FreeLibrary(dll);
+}
+
+typedef void(__cdecl* GetBonesFunc)(const char*, const char*, char**, int, int&);
+std::vector<std::string> CallGetDaeBoneNamesFromDLL(const std::string& daePath, const std::string& meshName) {
+    HMODULE dll = LoadLibraryA("tinyxml2patcher.dll");
+    if (!dll) {
+        std::cerr << "couldn't load tinyxml2patcher.dll\n";
+        return {};
+    }
+
+    typedef void(__cdecl* GetBonesFunc)(const char*, const char*, char**, int, int*);
+    GetBonesFunc func = (GetBonesFunc)GetProcAddress(dll, "GetDaeBoneNames_C");
+    if (!func) {
+        std::cerr << "couldn't find GetDaeBoneNames_C\n";
+        FreeLibrary(dll);
+        return {};
+    }
+
+    const int maxBones = 256;
+    char* outputBones[maxBones];
+    for (int i = 0; i < maxBones; ++i)
+        outputBones[i] = new char[256];
+
+    int count = 0;
+
+    printf("calling GetDaeBoneNames_C: mesh=%s\n", meshName.c_str());
+
+    func(daePath.c_str(), meshName.c_str(), outputBones, maxBones, &count);
+
+    printf("returned bone count: %d\n", count);
+
+    std::vector<std::string> result;
+    for (int i = 0; i < count; ++i)
+        result.push_back(outputBones[i]);
+
+    for (int i = 0; i < maxBones; ++i)
+        delete[] outputBones[i];
+
+    FreeLibrary(dll);
+    return result;
 }
 
 // all funcs to use the structs in coolstructs.h
@@ -177,11 +291,12 @@ BoneData ReadBoneData(std::istream& stream) {
     b.Scale = ReadFloats(stream, 3);
     b.Rotation = ReadFloats(stream, 3);
     b.Translation = ReadFloats(stream, 3);
-    b.BoundingBox = ReadUInt32s(stream, 4);
+    b.BoundingBox = ReadFloats(stream, 4);
     b.ModelObjectArrayOffset = ReadUInt32s(stream, 1)[0];
     b.ChildrenArrayOffset = ReadUInt32s(stream, 1)[0];
     b.MoreFloats = ReadFloats(stream, 3);
-    b.Unknowns2 = ReadUInt32s(stream, 12);
+	b.AnimationVals = ReadFloats(stream, 6);
+    b.BoundingBoxMaxMin = ReadFloats(stream, 6);
     return b;
 }
 
@@ -207,6 +322,285 @@ SubMesh ReadSubMesh(std::istream& stream) {
     return s;
 }
 
+std::vector<std::string> GetDaeBoneNames(const std::string& daeFile, const std::string& meshName) {
+    std::ifstream dae(daeFile.c_str());
+    if (!dae.is_open()) {
+        std::cerr << "couldn't open dae file\n";
+        return {};
+    }
+
+    std::vector<std::string> boneNames;
+    std::string line;
+    bool foundSkin = false;
+    bool readingBones = false;
+    std::string boneData;
+
+    while (std::getline(dae, line)) {
+        if (!foundSkin) {
+            if (line.find("<skin") != std::string::npos && line.find(meshName) != std::string::npos) {
+                foundSkin = true;
+            }
+        }
+        else if (!readingBones) {
+            if (line.find("<Name_array") != std::string::npos) {
+                readingBones = true;
+                size_t gt = line.find('>');
+                if (gt != std::string::npos) {
+                    size_t lt = line.find('<', gt);
+                    if (lt != std::string::npos) {
+                        boneData += line.substr(gt + 1, lt - gt - 1);
+                        readingBones = false;
+                        break;
+                    }
+                    else {
+                        boneData += line.substr(gt + 1);
+                    }
+                }
+            }
+        }
+        else {
+            size_t lt = line.find('<');
+            if (lt != std::string::npos) {
+                boneData += " " + line.substr(0, lt);
+                readingBones = false;
+                break;
+            }
+            else {
+                boneData += " " + line;
+            }
+        }
+    }
+
+    dae.close();
+
+    std::istringstream iss(boneData);
+    std::string name;
+    while (iss >> name)
+        boneNames.push_back(name);
+
+    return boneNames;
+}
+
+MKDXData LoadMKDXFile(std::ifstream& fs)
+{
+    MKDXData data;
+
+    auto headerData = ReadHeader(fs);
+    std::cout << "\nRead header: MaterialCount=" << headerData.MaterialCount << ", TextureMapsCount=" << headerData.TextureMapsCount << "\n";
+
+    fs.seekg(headerData.MaterialArrayOffset, std::ios::beg);
+    std::vector<Material> materialsData;
+    for (uint32_t i = 0; i < headerData.MaterialCount; ++i)
+        materialsData.push_back(ReadMaterial(fs));
+    std::cout << "Read materials: " << materialsData.size() << " materials added\n";
+
+    fs.seekg(headerData.TextureNameArrayOffset, std::ios::beg);
+    std::vector<TextureName> textureNames;
+    for (uint32_t i = 0; i < headerData.TextureMapsCount; ++i) {
+        uint32_t ptr;
+        fs.read(reinterpret_cast<char*>(&ptr), sizeof(ptr));
+        auto texName = ReadCStringAtOffset(fs, ptr);
+        textureNames.push_back(TextureName{ texName, ptr });
+        std::cout << "[" << i << "] " << texName << "\n";
+    }
+    std::cout << "Read texture names: " << textureNames.size() << " names added\n";
+
+    // seek to and read bone names
+    fs.seekg(headerData.BoneNameArrayOffset, std::ios::beg);
+    std::vector<NodeNames> boneNames;
+    for (uint32_t i = 0; i < headerData.BoneCount; ++i) {
+        uint32_t namePtr, dataOffset;
+        fs.read(reinterpret_cast<char*>(&namePtr), sizeof(namePtr));
+        fs.read(reinterpret_cast<char*>(&dataOffset), sizeof(dataOffset));
+        auto boneName = ReadCStringAtOffset(fs, namePtr);
+        boneNames.push_back(NodeNames{ dataOffset, boneName, namePtr });
+    }
+
+    // read node links
+    fs.seekg(headerData.LinkNodeOffset, std::ios::beg);
+    std::vector<NodeLinks> nodeLinks;
+    for (uint32_t i = 0; i < headerData.LinkNodeCount; ++i) {
+        uint32_t meshOffset, boneOffset, dummy;
+        fs.read(reinterpret_cast<char*>(&meshOffset), sizeof(meshOffset));
+        fs.read(reinterpret_cast<char*>(&boneOffset), sizeof(boneOffset));
+        fs.read(reinterpret_cast<char*>(&dummy), sizeof(dummy)); // unused
+
+        auto it = std::find_if(nodeLinks.begin(), nodeLinks.end(), [meshOffset](const NodeLinks& n) { return n.MeshOffset == meshOffset; });
+        if (it == nodeLinks.end()) {
+            nodeLinks.push_back(NodeLinks{ meshOffset });
+            it = std::prev(nodeLinks.end());
+        }
+        it->BoneOffsets.push_back(boneOffset);
+
+        auto boneIt = std::find_if(boneNames.begin(), boneNames.end(), [boneOffset](const NodeNames& n) { return n.DataOffset == boneOffset; });
+        std::string boneName = (boneIt != boneNames.end()) ? boneIt->Name : "(unknown)";
+        //std::cout << "Linked meshOffset " << std::hex << meshOffset << " to boneOffset " << boneOffset << " (" << boneName << ")\n";
+    }
+
+    // read all node names
+    fs.seekg(headerData.TotalNodeArrayOffset, std::ios::beg);
+    std::vector<NodeNames> allNodeNames;
+    for (uint32_t i = 0; i < headerData.TotalNodeCount; ++i) {
+        uint32_t namePtr, dataOffset;
+        fs.read(reinterpret_cast<char*>(&namePtr), sizeof(namePtr));
+        fs.read(reinterpret_cast<char*>(&dataOffset), sizeof(dataOffset));
+        auto name = ReadCStringAtOffset(fs, namePtr);
+        allNodeNames.push_back(NodeNames{ dataOffset, name, namePtr });
+        std::cout << "Added node: offset " << std::hex << dataOffset << " = \"" << name << "\"\n";
+    }
+
+    // read root nodes (usually just 1)
+    fs.seekg(headerData.RootNodeArrayOffset, std::ios::beg);
+    std::vector<uint32_t> rootNodes;
+    while (true) {
+        uint32_t val;
+        fs.read(reinterpret_cast<char*>(&val), sizeof(val));
+        if (val == 0) break;
+        rootNodes.push_back(val);
+
+        auto nodeIt = std::find_if(allNodeNames.begin(), allNodeNames.end(), [val](const NodeNames& n) { return n.DataOffset == val; });
+        std::string name = (nodeIt != allNodeNames.end()) ? nodeIt->Name : "(unknown)";
+        std::cout << "Added root node offset: " << std::hex << val << " (" << name << ")\n";
+    }
+
+    std::vector<FullNodeData> fullNodeDataList;
+
+    for (const auto& node : allNodeNames) {
+        fs.seekg(node.DataOffset, std::ios::beg);
+        BoneData boneData = ReadBoneData(fs);
+
+        uint32_t meshy = boneData.ModelObjectArrayOffset;
+        uint32_t childy = boneData.ChildrenArrayOffset;
+
+        FullNodeData fullData;
+        fullData.boneData = boneData;
+
+        if (meshy > 0) {
+            int j = 0;
+            while (true) {
+                fs.seekg(meshy + j * 4, std::ios::beg);
+                uint32_t submeshOffset;
+                fs.read(reinterpret_cast<char*>(&submeshOffset), sizeof(submeshOffset));
+                if (submeshOffset == 0) break;
+
+                fs.seekg(submeshOffset, std::ios::beg);
+                SubMesh submeshData = ReadSubMesh(fs);
+                fullData.subMeshes.push_back(submeshData);
+
+                uint32_t vCount = submeshData.VertexCount;
+                uint32_t pCount = submeshData.TriangleCount;
+                uint32_t wCount = submeshData.SkinnedBonesCount;
+
+                if (submeshData.VertexPositionOffset > 0) {
+                    fs.seekg(submeshData.VertexPositionOffset, std::ios::beg);
+                    std::vector<float> verts(vCount * 3);
+                    fs.read(reinterpret_cast<char*>(verts.data()), verts.size() * sizeof(float));
+                    fullData.verticesList.push_back(verts);
+                }
+                if (submeshData.VertexNormalOffset > 0) {
+                    fs.seekg(submeshData.VertexNormalOffset, std::ios::beg);
+                    std::vector<float> norms(vCount * 3);
+                    fs.read(reinterpret_cast<char*>(norms.data()), norms.size() * sizeof(float));
+                    fullData.normalsList.push_back(norms);
+                }
+                if (submeshData.ColorBufferOffset > 0) {
+                    fs.seekg(submeshData.ColorBufferOffset, std::ios::beg);
+                    std::vector<float> colors(vCount * 4);
+                    fs.read(reinterpret_cast<char*>(colors.data()), colors.size() * sizeof(float));
+                    fullData.colorsList.push_back(colors);
+                }
+                if (submeshData.TexCoord0Offset > 0) {
+                    fs.seekg(submeshData.TexCoord0Offset, std::ios::beg);
+                    std::vector<float> uvs0(vCount * 2);
+                    fs.read(reinterpret_cast<char*>(uvs0.data()), uvs0.size() * sizeof(float));
+                    fullData.uvs0List.push_back(uvs0);
+                }
+                if (submeshData.TexCoord1Offset > 0) {
+                    fs.seekg(submeshData.TexCoord1Offset, std::ios::beg);
+                    std::vector<float> uvs1(vCount * 2);
+                    fs.read(reinterpret_cast<char*>(uvs1.data()), uvs1.size() * sizeof(float));
+                    fullData.uvs1List.push_back(uvs1);
+                }
+                if (submeshData.TexCoord2Offset > 0) {
+                    fs.seekg(submeshData.TexCoord2Offset, std::ios::beg);
+                    std::vector<float> uvs2(vCount * 2);
+                    fs.read(reinterpret_cast<char*>(uvs2.data()), uvs2.size() * sizeof(float));
+                    fullData.uvs2List.push_back(uvs2);
+                }
+                if (submeshData.TexCoord3Offset > 0) {
+                    fs.seekg(submeshData.TexCoord3Offset, std::ios::beg);
+                    std::vector<float> uvs3(vCount * 2);
+                    fs.read(reinterpret_cast<char*>(uvs3.data()), uvs3.size() * sizeof(float));
+                    fullData.uvs3List.push_back(uvs3);
+                }
+                if (submeshData.FaceOffset > 0) {
+                    fs.seekg(submeshData.FaceOffset, std::ios::beg);
+                    std::vector<uint16_t> polys(pCount * 3);
+                    fs.read(reinterpret_cast<char*>(polys.data()), polys.size() * sizeof(uint16_t));
+                    fullData.polygonsList.push_back(polys);
+                }
+                if (submeshData.WeightOffset > 0) {
+                    fs.seekg(submeshData.WeightOffset, std::ios::beg);
+                    std::vector<float> weights(wCount * vCount);
+                    fs.read(reinterpret_cast<char*>(weights.data()), weights.size() * sizeof(float));
+                    fullData.weightsList.push_back(weights);
+                }
+                j++;
+            }
+        }
+
+        if (childy > 0) {
+            fs.seekg(childy, std::ios::beg);
+            while (true) {
+                uint32_t childOffset;
+                fs.read(reinterpret_cast<char*>(&childOffset), sizeof(childOffset));
+                if (childOffset == 0) break;
+                fullData.childrenIndexList.push_back(childOffset);
+            }
+        }
+
+        fullNodeDataList.push_back(fullData);
+    }
+
+    for (auto& node : fullNodeDataList) {
+        for (size_t i = 0; i < node.childrenIndexList.size(); ++i)
+            node.childrenIndexList[i] = static_cast<uint32_t>(
+                std::find_if(allNodeNames.begin(), allNodeNames.end(),
+                    [&](const NodeNames& n) { return n.DataOffset == node.childrenIndexList[i]; }) - allNodeNames.begin());
+    }
+
+    for (size_t i = 0; i < rootNodes.size(); ++i) {
+        rootNodes[i] = static_cast<uint32_t>(
+            std::find_if(allNodeNames.begin(), allNodeNames.end(),
+                [&](const NodeNames& n) { return n.DataOffset == rootNodes[i]; }) - allNodeNames.begin());
+    }
+
+    for (auto& link : nodeLinks) {
+        link.MeshOffset = static_cast<uint32_t>(
+            std::find_if(allNodeNames.begin(), allNodeNames.end(),
+                [&](const NodeNames& n) { return n.DataOffset == link.MeshOffset; }) - allNodeNames.begin());
+
+        for (size_t i = 0; i < link.BoneOffsets.size(); ++i) {
+            link.BoneOffsets[i] = static_cast<uint32_t>(
+                std::find_if(allNodeNames.begin(), allNodeNames.end(),
+                    [&](const NodeNames& n) { return n.DataOffset == link.BoneOffsets[i]; }) - allNodeNames.begin());
+        }
+    }
+
+    fs.close();
+
+    data.headerData = headerData;
+    data.materialsData = materialsData;
+    data.textureNames = textureNames;
+    data.nodeLinks = nodeLinks;
+    data.allNodeNames = allNodeNames;
+    data.rootNodes = rootNodes;
+    data.fullNodeDataList = fullNodeDataList;
+    data.boneNames = boneNames;
+
+    return data;
+}
+
 // ========================================================
 // ========================================================
 // ====================    MAIN    ========================
@@ -224,8 +618,10 @@ int main(int argc, char* argv[])
     if (argc > 2) arg2 = argv[2];
 
 	// debug default file path
+    //if (filePathInput.empty()) filePathInput = "./KP_L_R_area3.bin";
     //if (filePathInput.empty()) filePathInput = "./rosetta_model.bin";
-	//if (filePathInput.empty()) filePathInput = "./rosetta_model_out_nomerge.dae"; arg2 = "./RosalinaPreset.txt";
+    //if (filePathInput.empty()) { filePathInput = "./rosettablender.dae"; arg2 = "./RosettaPreset.txt"; } else 
+    //arg2 = "n";
 
     if (filePathInput.empty()) {
         std::cout << "Usage for dae export: Drag and drop a .bin file onto the tool (in file explorer, not this window)\nOptional add \"n\" arg to skip merging the submeshes into full meshes\nExample cmd command 'MKDXTool mario_model.bin n'\n";
@@ -247,217 +643,17 @@ int main(int argc, char* argv[])
         // FIRE LOGO PRINT
         FireLogoPrint(56);
 
-        auto headerData = ReadHeader(fs);
-        std::cout << "\nRead header: MaterialCount=" << headerData.MaterialCount << ", TextureMapsCount=" << headerData.TextureMapsCount << "\n";
+        MKDXData data = LoadMKDXFile(fs);
 
-        fs.seekg(headerData.MaterialArrayOffset, std::ios::beg);
-        std::vector<Material> materialsData;
-        for (uint32_t i = 0; i < headerData.MaterialCount; ++i)
-            materialsData.push_back(ReadMaterial(fs));
-        std::cout << "Read materials: " << materialsData.size() << " materials added\n";
-
-        fs.seekg(headerData.TextureNameArrayOffset, std::ios::beg);
-        std::vector<TextureName> textureNames;
-        for (uint32_t i = 0; i < headerData.TextureMapsCount; ++i) {
-            uint32_t ptr;
-            fs.read(reinterpret_cast<char*>(&ptr), sizeof(ptr));
-            auto texName = ReadCStringAtOffset(fs, ptr);
-            textureNames.push_back(TextureName{ texName, ptr });
-            std::cout << "[" << i << "] " << texName << "\n";
-        }
-        std::cout << "Read texture names: " << textureNames.size() << " names added\n";
-
-        // seek to and read bone names
-        fs.seekg(headerData.BoneNameArrayOffset, std::ios::beg);
-        std::vector<NodeNames> boneNames;
-        for (uint32_t i = 0; i < headerData.BoneCount; ++i) {
-            uint32_t namePtr, dataOffset;
-            fs.read(reinterpret_cast<char*>(&namePtr), sizeof(namePtr));
-            fs.read(reinterpret_cast<char*>(&dataOffset), sizeof(dataOffset));
-            auto boneName = ReadCStringAtOffset(fs, namePtr);
-            boneNames.push_back(NodeNames{ dataOffset, boneName, namePtr });
-        }
-
-        // read node links
-        fs.seekg(headerData.LinkNodeOffset, std::ios::beg);
-        std::vector<NodeLinks> nodeLinks;
-        for (uint32_t i = 0; i < headerData.LinkNodeCount; ++i) {
-            uint32_t meshOffset, boneOffset, dummy;
-            fs.read(reinterpret_cast<char*>(&meshOffset), sizeof(meshOffset));
-            fs.read(reinterpret_cast<char*>(&boneOffset), sizeof(boneOffset));
-            fs.read(reinterpret_cast<char*>(&dummy), sizeof(dummy)); // unused
-
-            auto it = std::find_if(nodeLinks.begin(), nodeLinks.end(), [meshOffset](const NodeLinks& n) { return n.MeshOffset == meshOffset; });
-            if (it == nodeLinks.end()) {
-                nodeLinks.push_back(NodeLinks{ meshOffset });
-                it = std::prev(nodeLinks.end());
-            }
-            it->BoneOffsets.push_back(boneOffset);
-
-            auto boneIt = std::find_if(boneNames.begin(), boneNames.end(), [boneOffset](const NodeNames& n) { return n.DataOffset == boneOffset; });
-            std::string boneName = (boneIt != boneNames.end()) ? boneIt->Name : "(unknown)";
-            //std::cout << "Linked meshOffset " << std::hex << meshOffset << " to boneOffset " << boneOffset << " (" << boneName << ")\n";
-        }
-
-        // read all node names
-        fs.seekg(headerData.TotalNodeArrayOffset, std::ios::beg);
-        std::vector<NodeNames> allNodeNames;
-        for (uint32_t i = 0; i < headerData.TotalNodeCount; ++i) {
-            uint32_t namePtr, dataOffset;
-            fs.read(reinterpret_cast<char*>(&namePtr), sizeof(namePtr));
-            fs.read(reinterpret_cast<char*>(&dataOffset), sizeof(dataOffset));
-            auto name = ReadCStringAtOffset(fs, namePtr);
-            allNodeNames.push_back(NodeNames{ dataOffset, name, namePtr });
-            std::cout << "Added node: offset " << std::hex << dataOffset << " = \"" << name << "\"\n";
-        }
-
-        // read root nodes (usually just 1)
-        fs.seekg(headerData.RootNodeArrayOffset, std::ios::beg);
-        std::vector<uint32_t> rootNodes;
-        while (true) {
-            uint32_t val;
-            fs.read(reinterpret_cast<char*>(&val), sizeof(val));
-            if (val == 0) break;
-            rootNodes.push_back(val);
-
-            auto nodeIt = std::find_if(allNodeNames.begin(), allNodeNames.end(), [val](const NodeNames& n) { return n.DataOffset == val; });
-            std::string name = (nodeIt != allNodeNames.end()) ? nodeIt->Name : "(unknown)";
-            std::cout << "Added root node offset: " << std::hex << val << " (" << name << ")\n";
-        }
-
-        std::vector<FullNodeData> fullNodeDataList;
-
-        for (const auto& node : allNodeNames) {
-            fs.seekg(node.DataOffset, std::ios::beg);
-            BoneData boneData = ReadBoneData(fs);
-
-            uint32_t meshy = boneData.ModelObjectArrayOffset;
-            uint32_t childy = boneData.ChildrenArrayOffset;
-
-            FullNodeData fullData;
-            fullData.boneData = boneData;
-
-            if (meshy > 0) {
-                int j = 0;
-                while (true) {
-                    fs.seekg(meshy + j * 4, std::ios::beg);
-                    uint32_t submeshOffset;
-                    fs.read(reinterpret_cast<char*>(&submeshOffset), sizeof(submeshOffset));
-                    if (submeshOffset == 0) break;
-
-                    fs.seekg(submeshOffset, std::ios::beg);
-                    SubMesh submeshData = ReadSubMesh(fs);
-                    fullData.subMeshes.push_back(submeshData);
-
-                    uint32_t vCount = submeshData.VertexCount;
-                    uint32_t pCount = submeshData.TriangleCount;
-                    uint32_t wCount = submeshData.SkinnedBonesCount;
-
-                    if (submeshData.VertexPositionOffset > 0) {
-                        fs.seekg(submeshData.VertexPositionOffset, std::ios::beg);
-                        std::vector<float> verts(vCount * 3);
-                        fs.read(reinterpret_cast<char*>(verts.data()), verts.size() * sizeof(float));
-                        fullData.verticesList.push_back(verts);
-                    }
-                    if (submeshData.VertexNormalOffset > 0) {
-                        fs.seekg(submeshData.VertexNormalOffset, std::ios::beg);
-                        std::vector<float> norms(vCount * 3);
-                        fs.read(reinterpret_cast<char*>(norms.data()), norms.size() * sizeof(float));
-                        fullData.normalsList.push_back(norms);
-                    }
-                    if (submeshData.ColorBufferOffset > 0) {
-                        fs.seekg(submeshData.ColorBufferOffset, std::ios::beg);
-                        std::vector<float> colors(vCount * 4);
-                        fs.read(reinterpret_cast<char*>(colors.data()), colors.size() * sizeof(float));
-                        fullData.colorsList.push_back(colors);
-                    }
-                    if (submeshData.TexCoord0Offset > 0) {
-                        fs.seekg(submeshData.TexCoord0Offset, std::ios::beg);
-                        std::vector<float> uvs0(vCount * 2);
-                        fs.read(reinterpret_cast<char*>(uvs0.data()), uvs0.size() * sizeof(float));
-                        fullData.uvs0List.push_back(uvs0);
-                    }
-                    if (submeshData.TexCoord1Offset > 0) {
-                        fs.seekg(submeshData.TexCoord1Offset, std::ios::beg);
-                        std::vector<float> uvs1(vCount * 2);
-                        fs.read(reinterpret_cast<char*>(uvs1.data()), uvs1.size() * sizeof(float));
-                        fullData.uvs1List.push_back(uvs1);
-                    }
-                    if (submeshData.TexCoord2Offset > 0) {
-                        fs.seekg(submeshData.TexCoord2Offset, std::ios::beg);
-                        std::vector<float> uvs2(vCount * 2);
-                        fs.read(reinterpret_cast<char*>(uvs2.data()), uvs2.size() * sizeof(float));
-                        fullData.uvs2List.push_back(uvs2);
-                    }
-                    if (submeshData.TexCoord3Offset > 0) {
-                        fs.seekg(submeshData.TexCoord3Offset, std::ios::beg);
-                        std::vector<float> uvs3(vCount * 2);
-                        fs.read(reinterpret_cast<char*>(uvs3.data()), uvs3.size() * sizeof(float));
-                        fullData.uvs3List.push_back(uvs3);
-                    }
-                    if (submeshData.FaceOffset > 0) {
-                        fs.seekg(submeshData.FaceOffset, std::ios::beg);
-                        std::vector<uint16_t> polys(pCount * 3);
-                        fs.read(reinterpret_cast<char*>(polys.data()), polys.size() * sizeof(uint16_t));
-                        fullData.polygonsList.push_back(polys);
-                    }
-                    if (submeshData.WeightOffset > 0) {
-                        fs.seekg(submeshData.WeightOffset, std::ios::beg);
-                        std::vector<float> weights(wCount * vCount);
-                        fs.read(reinterpret_cast<char*>(weights.data()), weights.size() * sizeof(float));
-                        fullData.weightsList.push_back(weights);
-                    }
-                    j++;
-                }
-            }
-
-            if (childy > 0) {
-                fs.seekg(childy, std::ios::beg);
-                while (true) {
-                    uint32_t childOffset;
-                    fs.read(reinterpret_cast<char*>(&childOffset), sizeof(childOffset));
-                    if (childOffset == 0) break;
-                    fullData.childrenIndexList.push_back(childOffset);
-                }
-            }
-
-            fullNodeDataList.push_back(fullData);
-        }
-
-        for (auto& node : fullNodeDataList) {
-            for (size_t i = 0; i < node.childrenIndexList.size(); ++i)
-                node.childrenIndexList[i] = static_cast<uint32_t>(
-                    std::find_if(allNodeNames.begin(), allNodeNames.end(),
-                        [&](const NodeNames& n) { return n.DataOffset == node.childrenIndexList[i]; }) - allNodeNames.begin());
-        }
-
-        for (size_t i = 0; i < rootNodes.size(); ++i) {
-            rootNodes[i] = static_cast<uint32_t>(
-                std::find_if(allNodeNames.begin(), allNodeNames.end(),
-                    [&](const NodeNames& n) { return n.DataOffset == rootNodes[i]; }) - allNodeNames.begin());
-        }
-
-        for (auto& link : nodeLinks) {
-            link.MeshOffset = static_cast<uint32_t>(
-                std::find_if(allNodeNames.begin(), allNodeNames.end(),
-                    [&](const NodeNames& n) { return n.DataOffset == link.MeshOffset; }) - allNodeNames.begin());
-
-            for (size_t i = 0; i < link.BoneOffsets.size(); ++i) {
-                link.BoneOffsets[i] = static_cast<uint32_t>(
-                    std::find_if(allNodeNames.begin(), allNodeNames.end(),
-                        [&](const NodeNames& n) { return n.DataOffset == link.BoneOffsets[i]; }) - allNodeNames.begin());
-            }
-        }
-
-        fs.close();
-
-        SaveDaeFile(filePathInput, headerData, materialsData, textureNames, nodeLinks, allNodeNames, rootNodes, fullNodeDataList, arg2 != "n");
-        //SaveMKDXFile(filePathInput, headerData, materialsData, textureNames, boneNames, nodeLinks, allNodeNames, rootNodes, fullNodeDataList); // debug remake file
+        SaveDaeFile(filePathInput, data.headerData, data.materialsData, data.textureNames, data.nodeLinks, data.allNodeNames, data.rootNodes, data.fullNodeDataList, arg2 != "n");
+        //SaveMKDXFile(filePathInput, data.headerData, data.materialsData, data.textureNames, data.boneNames, data.nodeLinks, data.allNodeNames, data.rootNodes, data.fullNodeDataList); // debug remake file
     }
     else if (ext == ".dae")
     {
         // FIRE LOGO PRINT
         FireLogoPrint(56);
+
+        filePathInput = CloneAndFixFBXASC(filePathInput);
 
         Assimp::Importer importer;
         const aiScene* scene = importer.ReadFile(filePathInput, aiProcess_Triangulate | aiProcess_JoinIdenticalVertices);
@@ -471,7 +667,7 @@ int main(int argc, char* argv[])
         for (unsigned int i = 0; i < scene->mNumMeshes; ++i) {
             aiMesh* mesh = scene->mMeshes[i];
             std::cout << "\nmesh #" << i << "\n";
-            std::cout << "  name: " << (mesh->mName.length > 0 ? mesh->mName.C_Str() : "(unnamed)") << "\n";
+            std::cout << "  name: " << (mesh->mName.length > 0 ? mesh->mName.C_Str() : "(unnamed, this'll cause errors tell @blurro)") << "\n";
             std::cout << "  vertices: " << mesh->mNumVertices << "\n";
             std::cout << "  faces: " << mesh->mNumFaces << "\n";
 
@@ -500,6 +696,7 @@ int main(int argc, char* argv[])
         //presetPath = "RosalinaPreset.txt"; // debug path
 
         // try opening the file to check if it exists
+        presetPath.erase(std::remove(presetPath.begin(), presetPath.end(), '\"'), presetPath.end());
         std::ifstream check(presetPath);
         if (presetPath.empty() || !check.is_open()) {
             presetPath = "ExampleMatPreset.txt";
@@ -543,10 +740,11 @@ int main(int argc, char* argv[])
 
             std::vector<MaterialPreset> materials;
             std::vector<TextureName> textureNames;
-
+            std::vector<std::string> meshList;
             std::string line;
             int lineNumber = 0;
             bool inTextures = false;
+            bool inMeshes = false;
 
             auto readFloats = [&](std::istringstream& s, float* dst, int count) {
                 for (int i = 0; i < count; ++i) {
@@ -566,11 +764,12 @@ int main(int argc, char* argv[])
                 return true;
             };
 
+            std::map<std::string, std::array<float, 6>> animFloatMap;
             MaterialPreset currentMat;
             while (std::getline(presetFile, line)) {
                 ++lineNumber;
                 if (line.empty()) continue;
-                if (line[0] == '/' || line.substr(0, 2) == "//") continue;
+                if (line[0] == '/' || line[0] == ' ') continue;
 
                 std::istringstream iss(line);
                 std::string tag;
@@ -581,18 +780,43 @@ int main(int argc, char* argv[])
                         materials.push_back(currentMat);
                     }
                     currentMat = MaterialPreset();
+                    inTextures = false;
+                    inMeshes = false;
+                    continue;
+                }
+
+                if (tag == "#AnimFloats") {
+                    std::string boneName;
+                    float v0, v1, v2, v3, v4, v5;
+                    if (iss >> boneName >> v0 >> v1 >> v2 >> v3 >> v4 >> v5) {
+                        animFloatMap[boneName] = { v0, v1, v2, v3, v4, v5 };
+                    }
+                    else {
+                        printf("Invalid #AnimFloats line on %d\n", lineNumber);
+                    }
                     continue;
                 }
 
                 if (tag == "#Textures") {
-                    materials.push_back(currentMat);
                     inTextures = true;
+                    inMeshes = false;
                     continue;
                 }
-
+                if (tag == "#Meshes") {
+                    inTextures = false;
+                    inMeshes = true;
+                    continue;
+                }
+                
+                // if line starts with # then not reading names anymore
                 if (inTextures) {
-                    if (tag[0] == '#') break;
-                    textureNames.push_back({ line, 0 }); // 0 for NamePointer for now
+                    if (tag[0] == '#') inTextures = false;
+                    else textureNames.push_back({ line, 0 }); // 0 for NamePointer for now
+                    continue;
+                }
+                if (inMeshes) {
+                    if (tag[0] == '#') inMeshes = false;
+                    else meshList.push_back(line);
                     continue;
                 }
 
@@ -605,19 +829,38 @@ int main(int argc, char* argv[])
                 else if (tag == "#TEXREFLECTIVE") readInt(iss, currentMat.texReflective);
                 else if (tag == "#TEXENVIRONMENT") readInt(iss, currentMat.texEnvironment);
                 else if (tag == "#TEXNORMAL") readInt(iss, currentMat.texNormal);
+                else if (tag == "#UNKNOWN") readInt(iss, currentMat.unknownVal);
+                else if (tag == "#UNKNOWN2") readFloats(iss, &currentMat.unknownVal2, 1);
                 else std::cerr << "line " << lineNumber << ": unknown tag: " << tag << "\n";
             }
-            if (!inTextures) {
+            materials.push_back(currentMat);
+
+            if (textureNames.size() == 0) {
                 std::cerr << "no #Textures block found\n";
             }
-            else {
-                if (materials.size() != scene->mNumMaterials) {
-                    std::cerr << "error: expected " << scene->mNumMaterials << " materials, but loaded " << materials.size() << " from preset\n";
-                    system("pause");
-                    return 1;
-                }
-                std::cout << "loaded " << materials.size() << " materials and " << textureNames.size() << " textures\n";
+            if (meshList.size() == 0) {
+                std::cerr << "no #Meshes block found\n";
             }
+            int dummyMat = 0;
+            if (materials.size() == scene->mNumMaterials + 1) {
+                const auto& first = materials[0];
+                if (first.texAlbedo == -1 && first.texSpecular == -1 && first.texReflective == -1 &&
+                    first.texEnvironment == -1 && first.texNormal == -1) {
+                    dummyMat = 1;
+                    std::cout << "\nDetected and adding absent-from-dae dummy material from preset\n\n";
+                }
+            }
+            if (materials.size() != scene->mNumMaterials + dummyMat) {
+                std::cerr << "Error: expected " << scene->mNumMaterials << " materials, but loaded " << materials.size() << " from preset\n";
+                system("pause");
+                return 1;
+            }
+            std::cout << "loaded " << materials.size() << " materials, " << textureNames.size() << " textures, and " << meshList.size() << " meshes" << "\n";
+
+            // modify dae.tmp file to treat non-listed child mesh nodes of a listed mesh node as being submeshes of that listed mesh
+            CallNodeToSubmeshFromDLL(filePathInput, meshList);
+            // reload scene
+            scene = importer.ReadFile(filePathInput, aiProcess_Triangulate | aiProcess_JoinIdenticalVertices);
 
             // assign some header data
 			Header headerData;
@@ -633,14 +876,13 @@ int main(int argc, char* argv[])
 
             aiNode* root = scene->mRootNode;
 
-            // skip dummy parents named "Scene" or "Armature"
-            if (root && (std::string(root->mName.C_Str()) == "Scene" || std::string(root->mName.C_Str()) == "Armature")) {
-                if (root->mNumChildren > 0)
+            // skip dummy parent scene name and its child "Armature"
+            while (root && root->mNumChildren == 1) {
+                std::string childName = root->mChildren[0]->mName.C_Str();
+                if (childName == "Scene" || childName == "Armature" || childName.find("model") != std::string::npos)
                     root = root->mChildren[0];
-                if (root && (std::string(root->mName.C_Str()) == "Scene" || std::string(root->mName.C_Str()) == "Armature")) {
-                    if (root->mNumChildren > 0)
-                        root = root->mChildren[0];
-                }
+                else
+                    break;
             }
 
 			std::vector<aiNode*> allAiNodes; // rearranged nodes to match the order of fullNodeDataList
@@ -713,7 +955,6 @@ int main(int argc, char* argv[])
             // debug print
             //std::cout << "\nall nodes in order:\n"; for (const auto& node : allNodeNames) std::cout << "  " << node.Name << "\n";
 
-
             // create allBoneNames vector with struct NodeNames, keeping DataOffset same as original nodes
             std::vector<NodeNames> boneNames;
             boneNames.reserve(nonMeshNodes.size());
@@ -761,43 +1002,384 @@ int main(int argc, char* argv[])
                 m.TextureIndices[2] = static_cast<int16_t>(mat.texReflective);
                 m.TextureIndices[3] = static_cast<int16_t>(mat.texEnvironment);
                 m.TextureIndices[4] = static_cast<int16_t>(mat.texNormal);
+				m.Unknowns[0] = mat.unknownVal; // will try find out about it another time
+                m.Unknowns2[3] = mat.unknownVal2;
                 materialsData.push_back(m);
             }
 
-
-
-            // for every mesh, we will look at every submesh, get all bones that influence it, from this get the full list of unique bones influencing the mesh overall, the count of this list is the amount of bones that every submesh will be selecting from the start of its own list of bones (whether they contain weights or not)
-
-            // split meshes into submeshes
             std::vector<NodeLinks> nodeLinks;
+            uint32_t totalLinksCount = 0;
 
-            for (size_t nodeIndex = 0; nodeIndex < allAiNodes.size(); ++nodeIndex) {
-                aiNode* node = allAiNodes[nodeIndex];
-                if (node->mNumMeshes == 0) continue;
+            // create sorted index view
+            std::vector<size_t> sortedIndices(allAiNodes.size());
+            for (size_t i = 0; i < sortedIndices.size(); ++i)
+                sortedIndices[i] = i;
 
-                std::cout << "node " << nodeIndex << " has " << node->mNumMeshes << " submeshes\n";
-
-                for (unsigned int i = 0; i < node->mNumMeshes; ++i) {
-                    uint32_t meshIndex = node->mMeshes[i];
-                    aiMesh* mesh = scene->mMeshes[meshIndex];
-
-                    std::cout << "  submesh " << i
-                        << ": vertices = " << mesh->mNumVertices
-                        << ", triangles = " << mesh->mNumFaces
-                        << ", bones = " << mesh->mNumBones
-                        << "\n";
+            // sort the indices based on allAiNodes names
+            for (size_t i = 0; i < sortedIndices.size(); ++i) {
+                for (size_t j = i + 1; j < sortedIndices.size(); ++j) {
+                    if (strcmp(allAiNodes[sortedIndices[i]]->mName.C_Str(), allAiNodes[sortedIndices[j]]->mName.C_Str()) > 0)
+                        std::swap(sortedIndices[i], sortedIndices[j]);
                 }
             }
 
+            // loop in sorted order using the index indirection
+            for (size_t sortedIndex = 0; sortedIndex < sortedIndices.size(); ++sortedIndex) {
+                size_t originalIndex = sortedIndices[sortedIndex];
+                aiNode* node = allAiNodes[originalIndex];
 
+                auto& fullNode = fullNodeDataList[originalIndex];
+                // find uniqueBoneIndices from all bones in meshes of this node (order from daeBoneList will reorder them later)
+                std::vector<uint32_t> uniqueBoneIndices;
+                if (node->mNumMeshes > 0) {
+                    for (unsigned int meshIdx = 0; meshIdx < node->mNumMeshes; ++meshIdx) {
+                        aiMesh* mesh = scene->mMeshes[node->mMeshes[meshIdx]];
+                        for (unsigned int b = 0; b < mesh->mNumBones; ++b) {
+                            std::string boneName = mesh->mBones[b]->mName.C_Str();
+                            for (size_t boneIdx = 0; boneIdx < allAiNodes.size(); ++boneIdx) {
+                                if (boneName == allAiNodes[boneIdx]->mName.C_Str()) {
+                                    if (std::find(uniqueBoneIndices.begin(), uniqueBoneIndices.end(), static_cast<uint32_t>(boneIdx)) == uniqueBoneIndices.end())
+                                        uniqueBoneIndices.push_back(static_cast<uint32_t>(boneIdx));
+                                    break;
+                                }
+                            }
+                        }
+                    }
 
+                    // get daeBoneList order for this node’s submeshes (concatenate all daeBoneLists for submeshes)
+                    std::vector<std::string> daeBoneListCombined;
+                    for (unsigned int meshIdx = 0; meshIdx < node->mNumMeshes; ++meshIdx) {
+                        uint32_t meshIndex = node->mMeshes[meshIdx];
+                        aiMesh* mesh = scene->mMeshes[meshIndex];
+                        auto daeBoneList = CallGetDaeBoneNamesFromDLL(filePathInput, mesh->mName.C_Str());
 
-            // write headerdata link nodes count after splitting meshes into submeshes and ensuring a max of 6 each
-            
+                        daeBoneListCombined.insert(daeBoneListCombined.end(), daeBoneList.begin(), daeBoneList.end());
+                    }
+
+                    // reorder uniqueBoneIndices to follow order in daeBoneListCombined
+                    std::vector<uint32_t> reorderedUniqueBoneIndices;
+                    for (const auto& boneName : daeBoneListCombined) {
+                        for (auto it = uniqueBoneIndices.begin(); it != uniqueBoneIndices.end(); ++it) {
+                            if (allAiNodes[*it]->mName.C_Str() == boneName) {
+                                reorderedUniqueBoneIndices.push_back(*it);
+                                uniqueBoneIndices.erase(it);
+                                break;
+                            }
+                        }
+                    }
+                    uniqueBoneIndices = std::move(reorderedUniqueBoneIndices);
+
+                    // cap skinnedCount at 6 max or total bones count
+                    uint32_t skinnedCount = uniqueBoneIndices.size() > 6 ? 6 : static_cast<uint32_t>(uniqueBoneIndices.size());
+                    // build default mask: first skinnedCount bits set to 1, rest 0
+                    uint32_t defaultMask = (1u << skinnedCount) - 1;
+
+                    NodeLinks link;
+                    link.MeshOffset = originalIndex;
+                    link.BoneOffsets = uniqueBoneIndices;
+                    totalLinksCount += static_cast<uint32_t>(uniqueBoneIndices.size());
+
+                    fullNode.subMeshes.resize(node->mNumMeshes);
+                    for (size_t s = 0; s < fullNode.subMeshes.size(); ++s) {
+                        uint32_t meshIndex = node->mMeshes[s];
+                        aiMesh* mesh = scene->mMeshes[meshIndex];
+                        std::vector<std::string> daeBoneList = CallGetDaeBoneNamesFromDLL(filePathInput, mesh->mName.C_Str());
+
+                        uint32_t mask = defaultMask;
+                        std::vector<uint32_t> availableDefaults;
+                        for (uint32_t i = 0; i < skinnedCount; ++i)
+                            availableDefaults.push_back(i);
+
+                        std::cout << "processing mesh: " << mesh->mName.C_Str() << "\n";
+
+                        for (unsigned int b = 0; b < mesh->mNumBones; ++b) {
+                            std::string boneName = mesh->mBones[b]->mName.C_Str();
+
+                            auto it = std::find_if(uniqueBoneIndices.begin(), uniqueBoneIndices.end(),
+                                [&](uint32_t idx) { return allAiNodes[idx]->mName.C_Str() == boneName; });
+                            if (it == uniqueBoneIndices.end())
+                                continue;
+
+                            uint32_t boneIdx = static_cast<uint32_t>(std::distance(uniqueBoneIndices.begin(), it));
+                            uint32_t bit = 1u << boneIdx;
+
+                            if (mask & bit) {
+                                auto defIt = std::find(availableDefaults.begin(), availableDefaults.end(), boneIdx);
+                                if (defIt != availableDefaults.end())
+                                    availableDefaults.erase(defIt);
+                                continue;
+                            }
+
+                            if (!availableDefaults.empty()) {
+                                uint32_t defaultBitIdx = availableDefaults.back();
+                                availableDefaults.pop_back();
+
+                                mask &= ~(1u << defaultBitIdx);
+                                mask |= bit;
+                            }
+                        }
+
+                        //std::cout << "final mask bits: "; for (size_t i = 0; i < uniqueBoneIndices.size(); ++i) std::cout << ((mask & (1u << i)) ? '1' : '0') << "\n";
+
+                        fullNode.subMeshes[s].BonesIndexMask = mask;
+                        fullNode.subMeshes[s].SkinnedBonesCount = skinnedCount;
+                        fullNode.subMeshes[s].TriangleCount = mesh->mNumFaces;
+                        fullNode.subMeshes[s].MaterialIndex = mesh->mMaterialIndex + dummyMat;
+                        fullNode.subMeshes[s].VertexCount = mesh->mNumVertices;
+
+                        std::vector<float> verts, norms, cols, uv0, uv1, uv2, uv3;
+                        std::vector<uint16_t> indices;
+
+                        for (unsigned int v = 0; v < mesh->mNumVertices; ++v) {
+                            verts.push_back(mesh->mVertices[v].x);
+                            verts.push_back(mesh->mVertices[v].y);
+                            verts.push_back(mesh->mVertices[v].z);
+                        }
+                        fullNode.subMeshes[s].VertexPositionOffset = 1;
+
+                        if (mesh->HasNormals()) {
+                            for (unsigned int v = 0; v < mesh->mNumVertices; ++v) {
+                                norms.push_back(mesh->mNormals[v].x);
+                                norms.push_back(mesh->mNormals[v].y);
+                                norms.push_back(mesh->mNormals[v].z);
+                            }
+                            fullNode.subMeshes[s].VertexNormalOffset = 1;
+                        }
+
+                        // if vertex colouring is just all 1, 1, 1, 1 skip it
+                        bool allWhite = true;
+                        if (mesh->HasVertexColors(0) && mesh->mColors[0]) {
+                            for (unsigned int v = 0; v < mesh->mNumVertices; ++v) {
+                                auto& c = mesh->mColors[0][v];
+                                if (c.r != 1.f || c.g != 1.f || c.b != 1.f || c.a != 1.f) {
+                                    allWhite = false;
+                                    break;
+                                }
+                            }
+                        }
+                        else {
+                            allWhite = false; // or true depending on what you wanna assume if there's no color data
+                        }
+                        if (!allWhite && mesh->HasVertexColors(0) && mesh->mColors[0]) {
+                            for (unsigned int v = 0; v < mesh->mNumVertices; ++v) {
+                                cols.push_back(mesh->mColors[0][v].r);
+                                cols.push_back(mesh->mColors[0][v].g);
+                                cols.push_back(mesh->mColors[0][v].b);
+                                cols.push_back(mesh->mColors[0][v].a);
+                            }
+                            fullNode.subMeshes[s].ColorBufferOffset = 1;
+                        }
+                        else {
+                            fullNode.subMeshes[s].ColorBufferOffset = 0;
+                        }
+
+                        if (mesh->HasTextureCoords(0)) {
+                            for (unsigned int v = 0; v < mesh->mNumVertices; ++v) {
+                                uv0.push_back(mesh->mTextureCoords[0][v].x);
+                                uv0.push_back(mesh->mTextureCoords[0][v].y);
+                            }
+                            fullNode.subMeshes[s].TexCoord0Offset = 1;
+                        }
+                        if (mesh->HasTextureCoords(1)) {
+                            for (unsigned int v = 0; v < mesh->mNumVertices; ++v) {
+                                uv1.push_back(mesh->mTextureCoords[1][v].x);
+                                uv1.push_back(mesh->mTextureCoords[1][v].y);
+                            }
+                            fullNode.subMeshes[s].TexCoord1Offset = 1;
+                        }
+                        if (mesh->HasTextureCoords(2)) {
+                            for (unsigned int v = 0; v < mesh->mNumVertices; ++v) {
+                                uv2.push_back(mesh->mTextureCoords[2][v].x);
+                                uv2.push_back(mesh->mTextureCoords[2][v].y);
+                            }
+                            fullNode.subMeshes[s].TexCoord2Offset = 1;
+                        }
+                        if (mesh->HasTextureCoords(3)) {
+                            for (unsigned int v = 0; v < mesh->mNumVertices; ++v) {
+                                uv3.push_back(mesh->mTextureCoords[3][v].x);
+                                uv3.push_back(mesh->mTextureCoords[3][v].y);
+                            }
+                            fullNode.subMeshes[s].TexCoord3Offset = 1;
+                        }
+
+                        for (unsigned int f = 0; f < mesh->mNumFaces; ++f) {
+                            const aiFace& face = mesh->mFaces[f];
+                            for (unsigned int i = 0; i < face.mNumIndices; ++i)
+                                indices.push_back(static_cast<uint16_t>(face.mIndices[i]));
+                        }
+                        fullNode.subMeshes[s].FaceOffset = 1;
+
+                        // write all weights for this submesh
+                        std::vector<float> weightsForThisMesh;
+                        for (size_t i = 0; i < uniqueBoneIndices.size(); ++i) {
+                            if (!(mask & (1u << i))) continue;
+
+                            uint32_t boneNodeIndex = uniqueBoneIndices[i];
+                            const char* targetBoneName = allAiNodes[boneNodeIndex]->mName.C_Str();
+
+                            aiBone* aiBonePtr = nullptr;
+                            for (unsigned int b = 0; b < mesh->mNumBones; ++b) {
+                                if (std::strcmp(mesh->mBones[b]->mName.C_Str(), targetBoneName) == 0) {
+                                    aiBonePtr = mesh->mBones[b];
+                                    break;
+                                }
+                            }
+
+                            if (!aiBonePtr) {
+                                weightsForThisMesh.insert(weightsForThisMesh.end(), mesh->mNumVertices, 0.0f);
+                                continue;
+                            }
+
+                            std::vector<float> boneWeights(mesh->mNumVertices, 0.0f);
+                            for (unsigned int w = 0; w < aiBonePtr->mNumWeights; ++w) {
+                                unsigned int vertexId = aiBonePtr->mWeights[w].mVertexId;
+                                if (vertexId < mesh->mNumVertices)
+                                    boneWeights[vertexId] = aiBonePtr->mWeights[w].mWeight;
+                            }
+                            weightsForThisMesh.insert(weightsForThisMesh.end(), boneWeights.begin(), boneWeights.end());
+                        }
+
+                        fullNode.subMeshes[s].WeightOffset = weightsForThisMesh.empty() ? 0 : 1;
+                        fullNode.weightsList.push_back(std::move(weightsForThisMesh));
+
+                        // bounding box calc
+                        aiMatrix4x4 nodeTransform = node->mTransformation;
+                        aiNode* current = node->mParent;
+                        while (current) {
+                            nodeTransform = current->mTransformation * nodeTransform;
+                            current = current->mParent;
+                        }
+
+                        std::vector<aiVector3D> worldVerts;
+                        for (size_t v = 0; v < verts.size(); v += 3) {
+                            aiVector3D worldPos(verts[v], verts[v + 1], verts[v + 2]);
+                            worldPos *= nodeTransform;
+                            worldVerts.push_back(worldPos);
+                        }
+
+                        float maxX = -FLT_MAX, maxY = -FLT_MAX, maxZ = -FLT_MAX;
+                        float minX = FLT_MAX, minY = FLT_MAX, minZ = FLT_MAX;
+                        for (const auto& v : worldVerts) {
+                            if (v.x > maxX) maxX = v.x;
+                            if (v.y > maxY) maxY = v.y;
+                            if (v.z > maxZ) maxZ = v.z;
+                            if (v.x < minX) minX = v.x;
+                            if (v.y < minY) minY = v.y;
+                            if (v.z < minZ) minZ = v.z;
+                        }
+                        fullNode.subMeshes[s].BoundingBoxMaxMin[0] = maxX;
+                        fullNode.subMeshes[s].BoundingBoxMaxMin[1] = maxY;
+                        fullNode.subMeshes[s].BoundingBoxMaxMin[2] = maxZ;
+                        fullNode.subMeshes[s].BoundingBoxMaxMin[3] = minX;
+                        fullNode.subMeshes[s].BoundingBoxMaxMin[4] = minY;
+                        fullNode.subMeshes[s].BoundingBoxMaxMin[5] = minZ;
+
+                        aiVector3D center(0, 0, 0);
+                        for (const auto& v : worldVerts) center += v;
+                        center /= (float)worldVerts.size();
+
+                        float radius = 0.0f;
+                        for (const auto& v : worldVerts) {
+                            float distSq = (v - center).SquareLength();
+                            if (distSq > radius) radius = distSq;
+                        }
+                        radius = std::sqrt(radius);
+
+                        fullNode.subMeshes[s].BoundingBox[0] = center.x;
+                        fullNode.subMeshes[s].BoundingBox[1] = center.y;
+                        fullNode.subMeshes[s].BoundingBox[2] = center.z;
+                        fullNode.subMeshes[s].BoundingBox[3] = radius;
+
+                        fullNode.verticesList.push_back(std::move(verts));
+                        fullNode.normalsList.push_back(std::move(norms));
+                        fullNode.colorsList.push_back(std::move(cols));
+                        fullNode.uvs0List.push_back(std::move(uv0));
+                        fullNode.uvs1List.push_back(std::move(uv1));
+                        fullNode.uvs2List.push_back(std::move(uv2));
+                        fullNode.uvs3List.push_back(std::move(uv3));
+                        fullNode.polygonsList.push_back(std::move(indices));
+                    }
+                    nodeLinks.push_back(link);
+                }
+
+                // write 'animfloatmap' stuff from the txt preset
+                for (std::map<std::string, std::array<float, 6>>::const_iterator it = animFloatMap.begin(); it != animFloatMap.end(); ++it) {
+                    const std::string& boneName = it->first;
+                    const std::array<float, 6>& vals = it->second;
+
+                    for (size_t i = 0; i < allNodeNames.size(); ++i) {
+                        if (allNodeNames[i].Name == boneName) {
+                            for (int j = 0; j < 6; ++j)
+                                fullNodeDataList[i].boneData.AnimationVals[j] = vals[j];
+                            break;
+                        }
+                    }
+                }
+
+				// get global bounding box for this node
+                std::vector<aiVector3D> allWorldVerts;
+                collectWorldVerts(node, scene, aiMatrix4x4(), allWorldVerts);
+
+                if (!allWorldVerts.empty()) {
+                    aiVector3D center(0, 0, 0);
+                    for (const auto& v : allWorldVerts) center += v;
+                    center /= (float)allWorldVerts.size();
+
+                    float radius = 0.0f;
+                    for (const auto& v : allWorldVerts) {
+                        float distSq = (v - center).SquareLength();
+                        if (distSq > radius) radius = distSq;
+                    }
+                    radius = std::sqrt(radius);
+
+                    fullNode.boneData.BoundingBox[0] = center.x;
+                    fullNode.boneData.BoundingBox[1] = center.y;
+                    fullNode.boneData.BoundingBox[2] = center.z;
+                    fullNode.boneData.BoundingBox[3] = radius;
+
+                    printf("full world center (node + children): %f %f %f\n", center.x, center.y, center.z);
+                    printf("full world radius (node + children): %f\n", radius);
+
+                    float maxX = -FLT_MAX, maxY = -FLT_MAX, maxZ = -FLT_MAX;
+                    float minX = FLT_MAX, minY = FLT_MAX, minZ = FLT_MAX;
+
+                    for (const auto& v : allWorldVerts) {
+                        if (v.x > maxX) maxX = v.x;
+                        if (v.y > maxY) maxY = v.y;
+                        if (v.z > maxZ) maxZ = v.z;
+                        if (v.x < minX) minX = v.x;
+                        if (v.y < minY) minY = v.y;
+                        if (v.z < minZ) minZ = v.z;
+                    }
+
+                    fullNode.boneData.BoundingBoxMaxMin[0] = maxX;
+                    fullNode.boneData.BoundingBoxMaxMin[1] = maxY;
+                    fullNode.boneData.BoundingBoxMaxMin[2] = maxZ;
+                    fullNode.boneData.BoundingBoxMaxMin[3] = minX;
+                    fullNode.boneData.BoundingBoxMaxMin[4] = minY;
+                    fullNode.boneData.BoundingBoxMaxMin[5] = minZ;
+                }
+                else {
+                    fullNode.boneData.BoundingBox[0] = 0.f;
+                    fullNode.boneData.BoundingBox[1] = 0.f;
+                    fullNode.boneData.BoundingBox[2] = 0.f;
+                    fullNode.boneData.BoundingBox[3] = 0.f;
+                    printf("no vertices found in node subtree\n");
+                }
+
+                std::cout << "node " << sortedIndex << " (" << node->mName.C_Str() << ") bones: ";
+                for (auto b : uniqueBoneIndices)
+                    std::cout << b << " ";
+                std::cout << "\n";
+            }
+
+            // set total links count in header
+            headerData.LinkNodeCount = totalLinksCount;
 
             check.close();
 
             SaveMKDXFile(filePathInput, headerData, materialsData, textureNames, boneNames, nodeLinks, allNodeNames, rootNodes, fullNodeDataList);
+            //std::remove(filePathInput.c_str()); // remove tmp file
         }
 	}
     else {
