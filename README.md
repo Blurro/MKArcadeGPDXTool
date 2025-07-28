@@ -33,6 +33,6 @@ All main meshes must be listed in preset txt so submeshes can be found and treat
 
 *If submesh explanation doesn't make sense, just export some characters with the 'n' arg and open in these 3D programs to see how submeshes work*
 
-This is my first time making a tool for an overlooked model format like this and I've definitely learned some things. First custom character on its way!
+This is my first time making a tool for an overlooked model format like this and I've definitely learned some things. Sonic custom character on the way!
 
-I've only tested on my own PC/OS and people quite often (rip) have problems with my tools that I don't run into so please contact me on Discord @blurro if you have any issues or suggestions! 3
+I've only tested on my own PC/OS and people quite often (rip) have problems with my tools that I don't run into so please contact me on Discord @blurro if you have any issues or suggestions!
