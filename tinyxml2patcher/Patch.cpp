@@ -14,17 +14,26 @@ struct Vec3 {
     float x, y, z;
 };
 
-tinyxml2::XMLElement* FindInstanceController(tinyxml2::XMLElement* node, const std::string& searchStr) {
-    if (!node) return nullptr;
+tinyxml2::XMLElement* FindInstance(tinyxml2::XMLElement* node, const std::string& geomUrl, const std::string& ctrlUrl) {
+    for (auto inst = node->FirstChildElement("instance_geometry"); inst; inst = inst->NextSiblingElement("instance_geometry")) {
+        const char* urlAttr = inst->Attribute("url");
+        if (urlAttr) {
+            //std::cout << "  checking instance_geometry url=" << urlAttr << "\n";
+            if (std::string(urlAttr) == geomUrl) return inst;
+        }
+    }
 
-    for (auto instCtrl = node->FirstChildElement("instance_controller"); instCtrl; instCtrl = instCtrl->NextSiblingElement("instance_controller")) {
-        if (instCtrl->Attribute("url") && std::string(instCtrl->Attribute("url")).find(searchStr) != std::string::npos)
-            return instCtrl;
+    for (auto inst = node->FirstChildElement("instance_controller"); inst; inst = inst->NextSiblingElement("instance_controller")) {
+        const char* urlAttr = inst->Attribute("url");
+        if (urlAttr) {
+            //std::cout << "  checking instance_controller url=" << urlAttr << "\n";
+            if (std::string(urlAttr) == ctrlUrl) return inst;
+        }
     }
 
     for (auto child = node->FirstChildElement("node"); child; child = child->NextSiblingElement("node")) {
-        auto result = FindInstanceController(child, searchStr);
-        if (result) return result;
+        auto found = FindInstance(child, geomUrl, ctrlUrl);
+        if (found) return found;
     }
 
     return nullptr;
@@ -148,7 +157,6 @@ extern "C" __declspec(dllexport) void __cdecl PatchDaeFile_C(const char* filePat
     for (auto geometry = libGeometries->FirstChildElement("geometry"); geometry; geometry = geometry->NextSiblingElement("geometry"), meshIdx++)
     {
         if (meshIdx >= allMaterialToIndices.size()) break;
-        std::string geometryId = geometry->Attribute("id") ? geometry->Attribute("id") : "";
         auto mesh = geometry->FirstChildElement("mesh");
         if (!mesh) continue;
 
@@ -183,42 +191,63 @@ extern "C" __declspec(dllexport) void __cdecl PatchDaeFile_C(const char* filePat
             mesh->InsertEndChild(newTri);
         }
 
-        // find instance_controller using geometry id
-        std::string searchStr = "#" + geometryId + "-skin";
+        std::string geometryId = geometry->Attribute("id") ? geometry->Attribute("id") : "";
+        std::string geomSearchStr = "#" + geometryId;
+        std::string ctrlSearchStr = geomSearchStr + "-skin";
+
         tinyxml2::XMLElement* targetInstance = nullptr;
 
         for (auto visualScene = libVisualScenes->FirstChildElement("visual_scene"); visualScene; visualScene = visualScene->NextSiblingElement("visual_scene")) {
-            targetInstance = FindInstanceController(visualScene, searchStr);
+            for (auto node = visualScene->FirstChildElement("node"); node; node = node->NextSiblingElement("node")) {
+                //std::cout << "searching for instance_geometry with url=" << geomSearchStr << " or instance_controller with url=" << ctrlSearchStr << "\n";
+                targetInstance = FindInstance(node, geomSearchStr, ctrlSearchStr);
+                if (targetInstance) break;
+            }
             if (targetInstance) break;
         }
 
         if (!targetInstance) {
-            std::cerr << "no instance_controller found for geometry " << geometryId << "\n";
+            std::cerr << "no instance_controller or instance_geometry found for geometry " << geometryId << "\n";
             continue;
         }
 
-        auto mat = targetInstance->FirstChildElement("bind_material")->FirstChildElement("technique_common")->FirstChildElement("instance_material");
+        auto matBind = targetInstance->FirstChildElement("bind_material");
+        if (!matBind) {
+            std::cerr << "no bind_material found\n";
+            continue;
+        }
+
+        auto techCommon = matBind->FirstChildElement("technique_common");
+        if (!techCommon) {
+            std::cerr << "no technique_common found in bind_material\n";
+            continue;
+        }
+
+        auto mat = techCommon->FirstChildElement("instance_material");
         if (!mat) {
-            std::cerr << "no instance_material found in instance_controller\n";
+            std::cerr << "no instance_material found in bind_material\n";
             continue;
         }
 
+        // clone + remap materials
         std::vector<tinyxml2::XMLElement*> newInstanceMaterials;
         for (size_t matIdx = 0; matIdx < matCount; matIdx++) {
             auto block = mat->DeepClone(&doc)->ToElement();
-            block->SetAttribute("symbol", ("defaultMaterial" + std::to_string(allMaterialToIndices[meshIdx][matIdx].first)).c_str());
-            block->SetAttribute("target", ("#material_" + std::to_string(allMaterialToIndices[meshIdx][matIdx].first)).c_str());
+            std::string symbol = "defaultMaterial" + std::to_string(allMaterialToIndices[meshIdx][matIdx].first);
+            std::string target = "#material_" + std::to_string(allMaterialToIndices[meshIdx][matIdx].first);
+            block->SetAttribute("symbol", symbol.c_str());
+            block->SetAttribute("target", target.c_str());
             newInstanceMaterials.push_back(block);
         }
 
-        auto techCommon = mat->Parent();
-        while (techCommon->FirstChild())
-            techCommon->DeleteChild(techCommon->FirstChild());
-        for (auto m : newInstanceMaterials)
-            techCommon->InsertEndChild(m);
+        // clear old materials
+        while (techCommon->FirstChild()) techCommon->DeleteChild(techCommon->FirstChild());
+        // insert new ones
+        for (auto m : newInstanceMaterials) techCommon->InsertEndChild(m);
 
         std::string prettyName = geometryId.size() > 2 && geometryId.compare(geometryId.size() - 2, 2, "_1") == 0
             ? geometryId.substr(0, geometryId.size() - 2) : geometryId;
+
         std::cout << "Fixed mesh " << prettyName << " to have " << (matCount - 1) << " extra mat(s)" << std::endl;
     }
 
@@ -336,29 +365,59 @@ extern "C" __declspec(dllexport) void __cdecl GetDaeNormals_C(const char* filePa
         return;
     }
 
-    py << "import maya.cmds as cmds\n\n";
+	// write the python script to apply normals in Maya
+    py << "import maya.api.OpenMaya as om\n";
+    py << "import maya.utils\n\n";
 
+    int meshIndex = 0;
     for (const auto& meshPair : meshNormals) {
         const std::string& mesh = meshPair.first;
         const std::vector<Vec3>& normals = meshPair.second;
 
-        py << "mesh = \"" << mesh << "\"\n";
-        py << "normals = [";
+        py << "def apply_normals_" << meshIndex << "():\n";
+        py << "    meshName = \"" << mesh << "\"\n";
+        py << "    normalsList = [\n        ";
         for (size_t j = 0; j < normals.size(); ++j) {
             const Vec3& n = normals[j];
-            py << "(" << n.x << "," << n.y << "," << n.z << ")";
-            if (j + 1 < normals.size()) py << ",";
+            py << "(" << n.x << ", " << n.y << ", " << n.z << ")";
+            if (j + 1 < normals.size()) py << ", ";
+            if ((j + 1) % 5 == 0) py << "\n        ";
         }
-        py << "]\n";
-        py << "for i, (x, y, z) in enumerate(normals):\n";
-        py << "    cmds.polyNormalPerVertex(f\"{mesh}.vtx[{i}]\", xyz=(x, y, z))\n\n";
+        py << "\n    ]\n";
+        py << "    try:\n";
+        py << "        sel = om.MSelectionList()\n";
+        py << "        sel.add(meshName)\n";
+        py << "        dagPath = sel.getDagPath(0)\n";
+        py << "        fnMesh = om.MFnMesh(dagPath)\n";
+        py << "        normals = [om.MVector(x, y, z) for (x, y, z) in normalsList]\n";
+        py << "        vertexIndices = list(range(len(normals)))\n";
+        py << "        fnMesh.setVertexNormals(normals, vertexIndices)\n";
+        py << "        print(f\"done {meshName}\")\n";
+        if (meshIndex + 1 < (int)meshNormals.size()) {
+            py << "        maya.utils.executeDeferred(apply_normals_" << (meshIndex + 1) << ")\n";
+        }
+        else {
+            py << "        maya.utils.executeDeferred(apply_normals_" << (meshIndex + 1) << ")\n"; // call the dummy one
+        }
+        py << "    except Exception as e:\n";
+        py << "        print(f\"error applying to {meshName}: {e}\")\n";
+        py << "\n";
+        meshIndex++;
     }
 
-    py << "# resize all joints radius\n";
-    py << "joints = cmds.ls(type='joint')\n";
-    py << "for j in joints:\n";
-    py << "    if cmds.attributeQuery('radius', node=j, exists=True):\n";
-    py << "        cmds.setAttr(f\"{j}.radius\", 0.3)\n";
+    // dummy last function to finalize and resize joints
+    py << "def apply_normals_" << meshIndex << "():\n";
+    py << "    print('All normals applied!')\n";
+    py << "    import maya.cmds as cmds\n";
+    py << "    joints = cmds.ls(type='joint')\n";
+    py << "    for j in joints:\n";
+    py << "        if cmds.attributeQuery('radius', node=j, exists=True):\n";
+    py << "            cmds.setAttr(f\"{j}.radius\", 0.3)\n";
+    py << "\n";
+
+    // kickoff
+    py << "maya.utils.executeDeferred(apply_normals_0)\n";
+
 
     py.close();
 
@@ -484,6 +543,10 @@ void MergeSuffixMeshes(XMLElement* node, const std::unordered_set<std::string>& 
             it->second->InsertEndChild(inst->DeepClone(&doc));
         }
 
+        for (XMLElement* inst = child->FirstChildElement("instance_geometry"); inst; inst = inst->NextSiblingElement("instance_geometry")) {
+            it->second->InsertEndChild(inst->DeepClone(&doc));
+        }
+
         toDelete.push_back(child);
     }
 
@@ -578,19 +641,19 @@ extern "C" __declspec(dllexport) void __cdecl GetDaeBoneNames_C(const char* file
         if (src && meshSourceRef == src) {
             targetController = controller;
             skin = trySkin;
-            printf("matched skin controller for mesh '%s': %s\n", meshName, controller->Attribute("id") ? controller->Attribute("id") : "<unnamed>");
+            //printf("matched skin controller for mesh '%s': %s\n", meshName, controller->Attribute("id") ? controller->Attribute("id") : "<unnamed>");
             break;
         }
     }
 
     if (!targetController || !skin) {
-        printf("no matching skin controller found for mesh: %s\n", meshName);
+        //printf("no matching skin controller found for mesh: %s\n", meshName);
         return;
     }
 
     auto* joints = skin->FirstChildElement("joints");
     if (!joints) {
-        printf("no <joints> inside <skin>\n");
+        //printf("no <joints> inside <skin>\n");
         return;
     }
 
@@ -605,7 +668,7 @@ extern "C" __declspec(dllexport) void __cdecl GetDaeBoneNames_C(const char* file
     }
 
     if (!jointSourceId) {
-        printf("no JOINT input source found\n");
+        //printf("no JOINT input source found\n");
         return;
     }
 
@@ -619,13 +682,13 @@ extern "C" __declspec(dllexport) void __cdecl GetDaeBoneNames_C(const char* file
     }
 
     if (!jointSource) {
-        printf("joint source not found: %s\n", jointSourceId);
+        //printf("joint source not found: %s\n", jointSourceId);
         return;
     }
 
     auto* nameArray = jointSource->FirstChildElement("Name_array");
     if (!nameArray || !nameArray->GetText()) {
-        printf("no Name_array found under joint source\n");
+        //printf("no Name_array found under joint source\n");
         return;
     }
 
@@ -706,7 +769,6 @@ extern "C" __declspec(dllexport) void __cdecl NodeToSubmesh_C(const char* filePa
 
         MergeSuffixMeshes(node, meshNameSet, meshNodeMap, doc);
 
-
         //continue;
         
         // move built mesh node to its correct place in hierarchy, if that exists
@@ -746,7 +808,7 @@ extern "C" __declspec(dllexport) void __cdecl NodeToSubmesh_C(const char* filePa
             };
 
         std::vector<tinyxml2::XMLElement*> allMeshes;
-        std::cout << "\ncollecting all mesh nodes under mesh children:\n";
+        //std::cout << "\ncollecting all mesh nodes under mesh children:\n";
         for (tinyxml2::XMLElement* meshChild : meshChildren)
             collectAllMeshNodes(meshChild, allMeshes, collectAllMeshNodes);
 
@@ -763,7 +825,7 @@ extern "C" __declspec(dllexport) void __cdecl NodeToSubmesh_C(const char* filePa
         auto collectPlaceholders = [&](tinyxml2::XMLElement* node, auto&& self) -> void {
             const char* name = node->Attribute("name");
             if (name && meshNames.count(name) && !seenPlaceholders.count(name)) {
-                std::cout << "  placeholder mesh found: " << name << "\n";
+                //std::cout << "  placeholder mesh found: " << name << "\n";
                 seenPlaceholders.insert(name);
                 placeholderMeshesUnderNonMeshChildren.push_back(node);
             }
@@ -772,7 +834,7 @@ extern "C" __declspec(dllexport) void __cdecl NodeToSubmesh_C(const char* filePa
                 self(child, self);
             };
 
-        std::cout << "\ncollecting all mesh placeholders under non-mesh children:\n";
+        //std::cout << "\ncollecting all mesh placeholders under non-mesh children:\n";
         for (tinyxml2::XMLElement* nonMeshChild : nonMeshChildren)
             collectPlaceholders(nonMeshChild, collectPlaceholders);
 
@@ -792,7 +854,7 @@ extern "C" __declspec(dllexport) void __cdecl NodeToSubmesh_C(const char* filePa
             }
 
             if (!matchingPlaceholder) {
-                std::cout << "no placeholder found for mesh: " << name << "\n";
+                //std::cout << "no placeholder found for mesh: " << name << "\n";
                 continue;
             }
 
@@ -845,14 +907,121 @@ extern "C" __declspec(dllexport) void __cdecl NodeToSubmesh_C(const char* filePa
                 child = nextChild;
             }
         }
-
-        // CHECK IF IT DELET MESH INSIDE OF HEAD IF HEAD DIDNT MOVE TO BONE HEIRARCHY BUT IF ACCS INSIDE HEAD DID
     }
-
-
-
 
     doc.SaveFile(filePath);
     std::cout << "\nmodified tmp file wahoo\n";
     //system("pause");
+}
+
+struct MaterialIndicesContext {
+    char** outMeshNames;
+    int* outMaterialIndices;
+    int maxEntries;
+    int count;
+    std::vector<std::string> materialIDs;
+};
+
+void VisitNodeRecursive(tinyxml2::XMLElement* node, MaterialIndicesContext& ctx) {
+    const char* nodeId = node->Attribute("id");
+    printf("visiting node: %s\n", nodeId ? nodeId : "<unnamed>");
+
+    auto* instGeom = node->FirstChildElement("instance_geometry");
+    if (instGeom && ctx.count < ctx.maxEntries) {
+        const char* geomUrl = instGeom->Attribute("url");
+        printf("  found instance_geometry: url=%s\n", geomUrl ? geomUrl : "<null>");
+
+        if (geomUrl && geomUrl[0] == '#') {
+            std::string meshName = geomUrl + 1;
+            printf("  mesh name: %s\n", meshName.c_str());
+
+            auto* bindMat = instGeom->FirstChildElement("bind_material");
+            if (bindMat) {
+                auto* techCommon = bindMat->FirstChildElement("technique_common");
+                if (techCommon) {
+                    auto* instMat = techCommon->FirstChildElement("instance_material");
+                    if (instMat) {
+                        const char* matTarget = instMat->Attribute("target");
+                        printf("  instance_material target: %s\n", matTarget ? matTarget : "<null>");
+
+                        if (matTarget && matTarget[0] == '#') {
+                            std::string matId = matTarget + 1;
+                            int matIndex = -1;
+
+                            for (size_t i = 0; i < ctx.materialIDs.size(); ++i) {
+                                if (ctx.materialIDs[i] == matId) {
+                                    matIndex = static_cast<int>(i);
+                                    break;
+                                }
+                            }
+
+                            printf("  resolved matId: %s to matIndex: %d\n", matId.c_str(), matIndex);
+
+                            if (matIndex >= 0) {
+                                strncpy_s(ctx.outMeshNames[ctx.count], 256, meshName.c_str(), _TRUNCATE);
+                                ctx.outMaterialIndices[ctx.count] = matIndex;
+                                printf("  stored: mesh=%s, index=%d\n", meshName.c_str(), matIndex);
+                                ++ctx.count;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    for (auto* child = node->FirstChildElement("node"); child; child = child->NextSiblingElement("node"))
+        VisitNodeRecursive(child, ctx);
+}
+
+extern "C" __declspec(dllexport)
+void __cdecl GetMaterialIndices_C(
+    const char* filePath,
+    char** outMeshNames,
+    int* outMaterialIndices,
+    int maxEntries,
+    int* outCount)
+{
+    printf("GetMaterialIndices_C called\n");
+    printf("  filePath: %s\n", filePath ? filePath : "<null>");
+    printf("  outMeshNames: %p\n", outMeshNames);
+    printf("  outMaterialIndices: %p\n", outMaterialIndices);
+    printf("  maxEntries: %d\n", maxEntries);
+    printf("  outCount: %p\n", outCount);
+
+    *outCount = 0;
+    if (!filePath || !outMeshNames || !outMaterialIndices || !outCount) return;
+
+    tinyxml2::XMLDocument doc;
+    if (doc.LoadFile(filePath) != tinyxml2::XML_SUCCESS) return;
+
+    auto* collada = doc.FirstChildElement("COLLADA");
+    if (!collada) return;
+
+    MaterialIndicesContext ctx{};
+    ctx.outMeshNames = outMeshNames;
+    ctx.outMaterialIndices = outMaterialIndices;
+    ctx.maxEntries = maxEntries;
+    ctx.count = 0;
+
+    auto* libMaterials = collada->FirstChildElement("library_materials");
+    if (libMaterials) {
+        for (auto* mat = libMaterials->FirstChildElement("material"); mat; mat = mat->NextSiblingElement("material")) {
+            const char* id = mat->Attribute("id");
+            ctx.materialIDs.push_back(id ? id : "");
+            printf("  found material id: %s\n", id ? id : "<null>");
+        }
+    }
+
+    auto* libVisualScenes = collada->FirstChildElement("library_visual_scenes");
+    if (!libVisualScenes) return;
+
+    auto* visualScene = libVisualScenes->FirstChildElement("visual_scene");
+    if (!visualScene) return;
+
+    for (auto* node = visualScene->FirstChildElement("node"); node; node = node->NextSiblingElement("node"))
+        VisitNodeRecursive(node, ctx);
+
+    *outCount = ctx.count;
+    printf("  total materials assigned: %d\n", ctx.count);
 }

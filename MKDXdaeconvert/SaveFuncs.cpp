@@ -689,16 +689,23 @@ void SaveDaeFile(const std::string& path, Header& headerData, std::vector<Materi
                 vertexOffset += vertexCount;
             }
 
+            bool anyRealWeights = false;
+            for (const auto& bw : boneWeightsMap) {
+                if (!bw.second.empty()) {
+                    anyRealWeights = true;
+                    break;
+                }
+            }
+
             // collect all filtered bones first, keep order, even if they have 0 weights
             std::vector<uint32_t> orderedBones;
             std::unordered_set<uint32_t> written;
-            if (linkIt != nodeLinks.end()) { // if this mesh has node links run this, else skip and just add the 0 weight extras
+            if (linkIt != nodeLinks.end()) {
                 for (uint32_t boneIdx : linkIt->BoneOffsets) {
                     if (written.insert(boneIdx).second)
                         orderedBones.push_back(boneIdx);
                 }
             }
-
             // add all other nodes (excluding mesh holders) that weren't already added
             for (const auto& kv : nodeMap) {
                 uint32_t nodeIdx = kv.first;
@@ -742,7 +749,7 @@ void SaveDaeFile(const std::string& path, Header& headerData, std::vector<Materi
         }
     }
 
-    std::cout << std::endl << "Writing..." << std::endl;
+    std::cout << std::endl << "Writing preset..." << std::endl;
 
     WritePresetFile(([](const std::string& p) {
         auto f = p.substr(p.find_last_of("/\\") + 1);
@@ -752,6 +759,7 @@ void SaveDaeFile(const std::string& path, Header& headerData, std::vector<Materi
         return f + "Preset.txt";
         })(path), materialsData, textureNames, allNodeNames, fullNodeDataList);
 
+    std::cout << std::endl << "Writing collada .dae..." << std::endl;
 
     Assimp::Exporter exporter;
     std::string outFile = path.substr(0, path.find_last_of('.')) + "_out.dae";
@@ -906,7 +914,8 @@ void SaveMKDXFile(const std::string& path, Header& header, std::vector<Material>
 
             if (submesh.ColorBufferOffset > 0) {
                 submesh.ColorBufferOffset = writer.tellp();
-                // write data (currently unknown)
+                for (float val : fullNodeData.colorsList[i]) writer.write((char*)&val, sizeof(float));
+                writer.write(std::vector<char>((16 - writer.tellp() % 16) % 16, 0).data(), (16 - writer.tellp() % 16) % 16);
             }
 
             if (submesh.TexCoord0Offset > 0) {

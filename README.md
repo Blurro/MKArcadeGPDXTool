@@ -12,15 +12,15 @@ I'm antsy waiting for the Switch 2 to be hacked so I can dive right into making 
 ## Usage
 
 ***Extracting*** Just drag and drop any Arcade GP DX .bin file onto the tool (in file explorer, not after opening)
-- If you plan to make a mod, make sure to add the 'n' argument for No merging of meshes!
 - If importing a tool export into Maya, you may find Maya likes to skip importing normals to skinned meshes - use the maya python script created next to the .dae to fix!
+- Add the 'm' arg after specifying the .bin file in the cmd line to merge submeshes to a full mesh. Additionally, in Maya you should use Edit Mesh > Merge (threshold 0) to fix dupe vertices. This will get the best export for use in another game or project. By default the tool will keep submeshes separate so that it can be ported back to a game file without issue.
 
 ***Importing*** Modify an existing .dae export in Maya or Blender and modify it, export .dae, drag and drop your .dae onto the tool.
 - MESHES MUST BE SPLIT TO HAVE MAX 6 BONE INFLUENCES (>6 assigned is fine but having >6 assigned bones with non-zero weights is not allowed)
 - MESHES MUST BE SPLIT BY MATERIAL TOO (only 1 mat/tex per submesh)
-- Split meshes become submeshes, guide below on how to pair them to their main mesh
+- Meshes that are currently split will become submeshes of their main mesh upon import, see guide below on how to pair them to their main mesh
 - For minimal errors, keep original names of everything! Animation editing coming next, this might allow custom mesh and bone names, unsure atm
-- Maya imports will turn '.' into 'FBXASC045', don't change this, the tool will still recognise this as a period
+- Maya imports will turn '.' into 'FBXASC045', don't change this, the tool will still recognise this as a period upon reimport
 - Modify the (character)Preset.txt file to add/modify materials and other values not handled by a .dae file
 
 **Submeshes in Maya:** All child meshes of a mesh will be treated as submeshes of that parent mesh - unless the mesh is listed in (character)Preset.txt file.
@@ -31,7 +31,7 @@ Child submeshes can be named anything (these names will not be saved in the game
 **Submeshes in Blender:** All submeshes are named the same as their main mesh + with suffix ".xxx" (a period followed by 3 digits), & are also siblings to their main mesh.
 All main meshes must be listed in preset txt so submeshes can be found and treated as such.
 
-*If submesh explanation doesn't make sense, just export some characters with the 'n' arg and open in these 3D programs to see how submeshes work*
+*If submesh explanation doesn't make sense, just export some characters and open them in these 3D programs to see how submeshes work*
 
 This is my first time making a tool for an overlooked model format like this and I've definitely learned some things. Sonic custom character on the way!
 

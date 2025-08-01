@@ -108,7 +108,7 @@ typedef struct {
 } Linkeys;
 
 // now jump to node links array
-if (header.linkNodeOffset > 0) {
+if (header.linkNodeOffset > 0 && header.linkNodeCount > 0) {
     FSeek(header.linkNodeOffset);
     Linkeys Links[header.linkNodeCount] <optimize=false>;
 }
@@ -118,7 +118,6 @@ typedef struct
     cstring Name;
     uint DataOffset;
 } TotalNodeys;
-
 FSeek(header.totalNodeArrayOffset);
 TotalNodeys AllNodeNames[header.totalNodeCount];
 
@@ -131,7 +130,8 @@ typedef struct {
     uint modelObjectArrayOffset;
     uint childrenArrayOffset;
     float morefloats[3];
-    float unknowns2[12];
+    float AnimFloats[6];
+    float boundingBoxMaxMin[6];
 } BoneyData;
 
 struct BoneMask
@@ -161,7 +161,7 @@ struct ModelObject
     uint SkinnedBonesCount;
     BoneMask BoneIndexMask;
     uint WeightOffset;
-    float boundingBoxMinMax[6];
+    float boundingBoxMaxMin[6];
 };
 local uint VertexCount;
 local uint weightBoneCount;

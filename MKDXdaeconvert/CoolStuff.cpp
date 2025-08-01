@@ -219,11 +219,11 @@ std::vector<std::string> CallGetDaeBoneNamesFromDLL(const std::string& daePath, 
 
     int count = 0;
 
-    printf("calling GetDaeBoneNames_C: mesh=%s\n", meshName.c_str());
+    //printf("calling GetDaeBoneNames_C: mesh=%s\n", meshName.c_str());
 
     func(daePath.c_str(), meshName.c_str(), outputBones, maxBones, &count);
 
-    printf("returned bone count: %d\n", count);
+    //printf("returned bone count: %d\n", count);
 
     std::vector<std::string> result;
     for (int i = 0; i < count; ++i)
@@ -234,6 +234,42 @@ std::vector<std::string> CallGetDaeBoneNamesFromDLL(const std::string& daePath, 
 
     FreeLibrary(dll);
     return result;
+}
+
+std::unordered_map<std::string, int> CallGetMaterialIndicesFromDLL(const std::string& daePath) {
+    HMODULE dll = LoadLibraryA("tinyxml2patcher.dll");
+    if (!dll) {
+        std::cerr << "failed to load tinyxml2patcher.dll\n";
+        return {};
+    }
+
+    typedef void(__cdecl* GetMapFunc)(const char*, char**, int*, int, int*);
+    GetMapFunc func = (GetMapFunc)GetProcAddress(dll, "GetMaterialIndices_C");
+    if (!func) {
+        std::cerr << "couldn't find GetMaterialIndices_C\n";
+        FreeLibrary(dll);
+        return {};
+    }
+
+    const int maxEntries = 1024;
+    char* meshNames[maxEntries];
+    int materialIndices[maxEntries];
+    int count = 0;
+
+    for (int i = 0; i < maxEntries; ++i)
+        meshNames[i] = new char[256];
+
+    func(daePath.c_str(), meshNames, materialIndices, maxEntries, &count);
+
+    std::unordered_map<std::string, int> meshToMaterial;
+    for (int i = 0; i < count; ++i)
+        meshToMaterial[meshNames[i]] = materialIndices[i];
+
+    for (int i = 0; i < maxEntries; ++i)
+        delete[] meshNames[i];
+
+    FreeLibrary(dll);
+    return meshToMaterial;
 }
 
 // all funcs to use the structs in coolstructs.h
@@ -320,65 +356,6 @@ SubMesh ReadSubMesh(std::istream& stream) {
     s.WeightOffset = ReadUInt32s(stream, 1)[0];
     s.BoundingBoxMaxMin = ReadFloats(stream, 6);
     return s;
-}
-
-std::vector<std::string> GetDaeBoneNames(const std::string& daeFile, const std::string& meshName) {
-    std::ifstream dae(daeFile.c_str());
-    if (!dae.is_open()) {
-        std::cerr << "couldn't open dae file\n";
-        return {};
-    }
-
-    std::vector<std::string> boneNames;
-    std::string line;
-    bool foundSkin = false;
-    bool readingBones = false;
-    std::string boneData;
-
-    while (std::getline(dae, line)) {
-        if (!foundSkin) {
-            if (line.find("<skin") != std::string::npos && line.find(meshName) != std::string::npos) {
-                foundSkin = true;
-            }
-        }
-        else if (!readingBones) {
-            if (line.find("<Name_array") != std::string::npos) {
-                readingBones = true;
-                size_t gt = line.find('>');
-                if (gt != std::string::npos) {
-                    size_t lt = line.find('<', gt);
-                    if (lt != std::string::npos) {
-                        boneData += line.substr(gt + 1, lt - gt - 1);
-                        readingBones = false;
-                        break;
-                    }
-                    else {
-                        boneData += line.substr(gt + 1);
-                    }
-                }
-            }
-        }
-        else {
-            size_t lt = line.find('<');
-            if (lt != std::string::npos) {
-                boneData += " " + line.substr(0, lt);
-                readingBones = false;
-                break;
-            }
-            else {
-                boneData += " " + line;
-            }
-        }
-    }
-
-    dae.close();
-
-    std::istringstream iss(boneData);
-    std::string name;
-    while (iss >> name)
-        boneNames.push_back(name);
-
-    return boneNames;
 }
 
 MKDXData LoadMKDXFile(std::ifstream& fs)
@@ -624,7 +601,7 @@ int main(int argc, char* argv[])
     //arg2 = "n";
 
     if (filePathInput.empty()) {
-        std::cout << "Usage for dae export: Drag and drop a .bin file onto the tool (in file explorer, not this window)\nOptional add \"n\" arg to skip merging the submeshes into full meshes\nExample cmd command 'MKDXTool mario_model.bin n'\n";
+        std::cout << "Usage for dae export: Drag and drop a .bin file onto the tool (in file explorer, not this window)\nOptional add \"m\" arg to merge submeshes into full meshes\nExample cmd command 'MKDXTool mario_model.bin m'\n";
 		std::cout << "\nUsage for mkdx bin file creation: Drag and drop a .dae file onto the tool, then enter your material preset path.\nOptional add material preset path arg to skip the prompt\nExample cmd command 'MKDXTool mario_model.dae mario_materials.txt'\n\n";
         system("pause");
         return 0;
@@ -645,7 +622,7 @@ int main(int argc, char* argv[])
 
         MKDXData data = LoadMKDXFile(fs);
 
-        SaveDaeFile(filePathInput, data.headerData, data.materialsData, data.textureNames, data.nodeLinks, data.allNodeNames, data.rootNodes, data.fullNodeDataList, arg2 != "n");
+        SaveDaeFile(filePathInput, data.headerData, data.materialsData, data.textureNames, data.nodeLinks, data.allNodeNames, data.rootNodes, data.fullNodeDataList, arg2 == "m");
         //SaveMKDXFile(filePathInput, data.headerData, data.materialsData, data.textureNames, data.boneNames, data.nodeLinks, data.allNodeNames, data.rootNodes, data.fullNodeDataList); // debug remake file
     }
     else if (ext == ".dae")
@@ -656,7 +633,7 @@ int main(int argc, char* argv[])
         filePathInput = CloneAndFixFBXASC(filePathInput);
 
         Assimp::Importer importer;
-        const aiScene* scene = importer.ReadFile(filePathInput, aiProcess_Triangulate | aiProcess_JoinIdenticalVertices);
+        const aiScene* scene = importer.ReadFile(filePathInput, aiProcess_Triangulate);
 
         if (!scene || !scene->HasMeshes()) {
             std::cerr << "failed to load scene or no meshes found\n";
@@ -876,13 +853,20 @@ int main(int argc, char* argv[])
 
             aiNode* root = scene->mRootNode;
 
-            // skip dummy parent scene name and its child "Armature"
-            while (root && root->mNumChildren == 1) {
-                std::string childName = root->mChildren[0]->mName.C_Str();
-                if (childName == "Scene" || childName == "Armature" || childName.find("model") != std::string::npos)
+            // always skip the first node (scene), then skip "Armature" if present
+            if (root) {
+                std::cout << "Skipping top-level root node \"" << root->mName.C_Str() << "\" with " << root->mNumChildren << " child(ren)\n";
+                if (root->mNumChildren == 1)
                     root = root->mChildren[0];
                 else
-                    break;
+                    root = nullptr;
+            }
+            if (root && (root->mName == aiString("Armature"))) {
+                std::cout << "Skipping node \"Armature\" with " << root->mNumChildren << " child(ren)\n";
+                if (root->mNumChildren == 1)
+                    root = root->mChildren[0];
+                else
+                    root = nullptr;
             }
 
 			std::vector<aiNode*> allAiNodes; // rearranged nodes to match the order of fullNodeDataList
@@ -1023,6 +1007,17 @@ int main(int argc, char* argv[])
                 }
             }
 
+            // fix material index on meshes (assimp loads in order of first used, not dae order)
+            auto meshMaterialMap = CallGetMaterialIndicesFromDLL(filePathInput);
+            for (unsigned int i = 0; i < scene->mNumMeshes; ++i) {
+                aiMesh* mesh = scene->mMeshes[i];
+                auto found = meshMaterialMap.find(mesh->mName.C_Str());
+                if (found != meshMaterialMap.end()) {
+                    std::cout << "  overriding material index of mesh " << mesh->mName.C_Str() << " to " << found->second << "\n";
+                    scene->mMeshes[i]->mMaterialIndex = found->second;
+                }
+            }
+
             // loop in sorted order using the index indirection
             for (size_t sortedIndex = 0; sortedIndex < sortedIndices.size(); ++sortedIndex) {
                 size_t originalIndex = sortedIndices[sortedIndex];
@@ -1083,7 +1078,6 @@ int main(int argc, char* argv[])
                     for (size_t s = 0; s < fullNode.subMeshes.size(); ++s) {
                         uint32_t meshIndex = node->mMeshes[s];
                         aiMesh* mesh = scene->mMeshes[meshIndex];
-                        std::vector<std::string> daeBoneList = CallGetDaeBoneNamesFromDLL(filePathInput, mesh->mName.C_Str());
 
                         uint32_t mask = defaultMask;
                         std::vector<uint32_t> availableDefaults;
@@ -1337,8 +1331,8 @@ int main(int argc, char* argv[])
                     fullNode.boneData.BoundingBox[2] = center.z;
                     fullNode.boneData.BoundingBox[3] = radius;
 
-                    printf("full world center (node + children): %f %f %f\n", center.x, center.y, center.z);
-                    printf("full world radius (node + children): %f\n", radius);
+                    //printf("full world center (node + children): %f %f %f\n", center.x, center.y, center.z);
+                    //printf("full world radius (node + children): %f\n", radius);
 
                     float maxX = -FLT_MAX, maxY = -FLT_MAX, maxZ = -FLT_MAX;
                     float minX = FLT_MAX, minY = FLT_MAX, minZ = FLT_MAX;
@@ -1364,13 +1358,11 @@ int main(int argc, char* argv[])
                     fullNode.boneData.BoundingBox[1] = 0.f;
                     fullNode.boneData.BoundingBox[2] = 0.f;
                     fullNode.boneData.BoundingBox[3] = 0.f;
-                    printf("no vertices found in node subtree\n");
+                    //printf("no vertices found in node subtree\n");
                 }
 
-                std::cout << "node " << sortedIndex << " (" << node->mName.C_Str() << ") bones: ";
-                for (auto b : uniqueBoneIndices)
-                    std::cout << b << " ";
-                std::cout << "\n";
+                //std::cout << "node " << sortedIndex << " (" << node->mName.C_Str() << ") bones: ";
+                //for (auto b : uniqueBoneIndices) std::cout << b << " " << "\n";
             }
 
             // set total links count in header
@@ -1379,7 +1371,7 @@ int main(int argc, char* argv[])
             check.close();
 
             SaveMKDXFile(filePathInput, headerData, materialsData, textureNames, boneNames, nodeLinks, allNodeNames, rootNodes, fullNodeDataList);
-            //std::remove(filePathInput.c_str()); // remove tmp file
+            std::remove(filePathInput.c_str()); // remove tmp file
         }
 	}
     else {
