@@ -18,6 +18,7 @@ I'm antsy waiting for the Switch 2 to be hacked so I can dive right into making 
 ***Importing*** Modify an existing .dae export in Maya or Blender and modify it, export .dae, drag and drop your .dae onto the tool.
 - MESHES MUST BE SPLIT TO HAVE MAX 6 BONE INFLUENCES (>6 assigned is fine but having >6 assigned bones with non-zero weights is not allowed)
 - MESHES MUST BE SPLIT BY MATERIAL TOO (only 1 mat/tex per submesh)
+- ALL OG NODES MUST EXIST so if your new model only has 1 mesh the missing mesh nodes must still exist as at least bones (bones, mesh, as long as its a node it works). *This may change once custom animations are possible, unsure*
 - Meshes that are currently split will become submeshes of their main mesh upon import, see guide below on how to pair them to their main mesh
 - For minimal errors, keep original names of everything! Animation editing coming next, this might allow custom mesh and bone names, unsure atm
 - Maya imports will turn '.' into 'FBXASC045', don't change this, the tool will still recognise this as a period upon reimport
