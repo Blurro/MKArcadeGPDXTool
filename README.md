@@ -20,7 +20,6 @@ I'm antsy waiting for the Switch 2 to be hacked so I can dive right into making 
 - MESHES MUST BE SPLIT BY MATERIAL TOO (only 1 mat/tex per submesh)
 - ALL OG BONES MUST EXIST but this may change once animations can be replaced
 - Meshes that are currently split will become submeshes of their main mesh upon import, see guide below on how to pair them to their main mesh
-- For minimal errors, keep original names of everything! Animation editing coming next, this might allow custom mesh and bone names, unsure atm
 - Maya imports will turn '.' into 'FBXASC045', don't change this, the tool will still recognise this as a period upon reimport
 - Modify the (character)Preset.txt file to add/modify materials and other values not handled by a .dae file
 
