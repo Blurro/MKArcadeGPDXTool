@@ -293,7 +293,28 @@ int WritePresetFile(const std::string& path, const std::vector<Material>& materi
     return 0;
 }
 
-void SaveDaeFile(const std::string& path, Header& headerData, std::vector<Material>& materialsData, std::vector<TextureName>& textureNames,
+std::string MakeOutFilePath(const std::string& path, const std::string& outDir)
+{
+    size_t slashPos = path.find_last_of("/\\");
+    std::string filename = (slashPos == std::string::npos) ? path : path.substr(slashPos + 1);
+
+    std::string dir = outDir;
+    if (!dir.empty() && dir.back() != '\\')
+        dir += "\\";
+
+    std::string fullPath = dir + filename;
+
+    // convert all forward slashes to backslashes
+    for (size_t i = 0; i < fullPath.size(); ++i)
+    {
+        if (fullPath[i] == '/')
+            fullPath[i] = '\\';
+    }
+
+    return fullPath;
+}
+
+void SaveDaeFile(const std::string& path, const std::string& outDir, Header& headerData, std::vector<Material>& materialsData, std::vector<TextureName>& textureNames,
     std::vector<NodeLinks>& nodeLinks, std::vector<NodeNames>& allNodeNames,
     std::vector<uint32_t>& rootNodes, std::vector<FullNodeData>& fullNodeDataList, const bool mergeSubmeshes)
 {
@@ -799,18 +820,18 @@ void SaveDaeFile(const std::string& path, Header& headerData, std::vector<Materi
 
     std::cout << std::endl << "Writing preset..." << std::endl;
 
-    WritePresetFile(([](const std::string& p) {
-        auto f = p.substr(p.find_last_of("/\\") + 1);
-        f = f.substr(0, f.find_last_of('.') == std::string::npos ? f.size() : f.find_last_of('.'));
-        f = f.substr(0, f.find('_') == std::string::npos ? f.size() : f.find('_'));
-        if (!f.empty()) f[0] = (char)toupper(f[0]);
-        return f + "Preset.txt";
-        })(path), materialsData, textureNames, allNodeNames, fullNodeDataList);
+    std::string presetFilename = path.substr(path.find_last_of("/\\") + 1);
+    presetFilename = presetFilename.substr(0, presetFilename.find_last_of('.') == std::string::npos ? presetFilename.size() : presetFilename.find_last_of('.'));
+    presetFilename = presetFilename.substr(0, presetFilename.find('_') == std::string::npos ? presetFilename.size() : presetFilename.find('_'));
+    if (!presetFilename.empty()) presetFilename[0] = (char)toupper(presetFilename[0]);
+    std::string presetPath = MakeOutFilePath(presetFilename + "Preset.txt", outDir);
+    WritePresetFile(presetPath, materialsData, textureNames, allNodeNames, fullNodeDataList);
 
     std::cout << std::endl << "Writing collada .dae..." << std::endl;
 
     Assimp::Exporter exporter;
     std::string outFile = path.substr(0, path.find_last_of('.')) + "_out.dae";
+    outFile = MakeOutFilePath(outFile, outDir);
     aiReturn rc;
     {
         Assimp::Exporter exporter;
@@ -820,14 +841,16 @@ void SaveDaeFile(const std::string& path, Header& headerData, std::vector<Materi
     CallPatchDaeFileDLL(outFile, allMaterialToIndices);
     CallGetNormalsFromDLL(outFile);
     std::cout << std::endl << "Saved file as " << outFile << std::endl;
+	std::ofstream(logPath.c_str(), std::ios::trunc) << "Saved collada file to " << outFile << "\n\nAlong with Maya py script to import normals\n(Blender can skip this)\n\nCreated " << presetFilename + "Preset.txt" << " file for MKDX importing" << std::endl;
 }
 
-void SaveMKDXFile(const std::string& path, Header& header, std::vector<Material>& materialsData,
+void SaveMKDXFile(const std::string& path, const std::string& outDir, Header& header, std::vector<Material>& materialsData,
     std::vector<TextureName>& textureNames, std::vector<NodeNames>& boneNames,
     std::vector<NodeLinks>& nodeLinks, std::vector<NodeNames>& allNodeNames,
     std::vector<uint32_t>& rootNodes, std::vector<FullNodeData>& fullNodeDataList)
 {
     std::string outFile = path.substr(0, path.find_last_of('.')) + "_out.bin";
+    outFile = MakeOutFilePath(outFile, outDir);
     std::ofstream writer(outFile, std::ios::binary);
 
     // Write the header with all offsets as 0 for now
@@ -1185,5 +1208,6 @@ void SaveMKDXFile(const std::string& path, Header& header, std::vector<Material>
     }
 
     writer.close();
-    std::cout << "\nSaved binary MKDX file as " << outFile << std::endl;
+    std::cout << "\nSaved binary MKDX file to " << outFile << std::endl;
+    std::ofstream(logPath.c_str(), std::ios::trunc) << "Saved binary MKDX file to " << outFile << std::endl;
 }

@@ -16,6 +16,7 @@
 #include <set>
 #include <unordered_map>
 #include <array>
+#include <sys/stat.h>
 
 #define _CRT_SECURE_NO_WARNINGS
 // my headers
@@ -597,6 +598,31 @@ MKDXData LoadMKDXFile(std::ifstream& fs)
     return data;
 }
 
+bool dirExists(const std::string& path) {
+    struct stat info;
+    return stat(path.c_str(), &info) == 0 && (info.st_mode & S_IFDIR);
+}
+
+std::string MakeAbsolutePath(const std::string& path)
+{
+#ifdef _WIN32
+    char absPath[_MAX_PATH];
+    if (_fullpath(absPath, path.c_str(), _MAX_PATH))
+        return std::string(absPath);
+    else
+        return path; // fallback if fail
+#else
+    char absPath[PATH_MAX];
+    if (realpath(path.c_str(), absPath))
+        return std::string(absPath);
+    else
+        return path; // fallback if fail
+#endif
+}
+
+// define global logPath
+std::string logPath;
+
 // ========================================================
 // ========================================================
 // ====================    MAIN    ========================
@@ -607,11 +633,40 @@ int main(int argc, char* argv[])
     std::cout << "\033[34mVery epic mkagpdx dae tool\033[37m\n";
     std::cout << "Cool tool for some exports and imports\n\n";
 
-    // get exe directory
+    char exePath[MAX_PATH];
+    GetModuleFileNameA(NULL, exePath, MAX_PATH);
+    std::string pathStr(exePath);
+    size_t pos = pathStr.find_last_of("\\/");
+    std::string exeDir = (pos == std::string::npos) ? "." : pathStr.substr(0, pos);
+    logPath = exeDir + "\\message.log";
+    std::ofstream(logPath.c_str(), std::ios::trunc) << "Unspecified error, contact @blurro on discord";
+
+    // get args
     std::string filePathInput;
-    std::string arg2;
+    std::string outDir;
+    std::string txtFilePath;
+    bool mergeOn = false;
+
     if (argc > 1) filePathInput = argv[1];
-    if (argc > 2) arg2 = argv[2];
+
+    bool outDirEmpty = true;
+    for (int i = 2; i < argc; i++) {
+        if (strcmp(argv[i], "m") == 0) {
+            mergeOn = true;
+        }
+        else {
+            // if multiple outDirs passed, last one wins
+            outDir = argv[i];
+			outDirEmpty = false;
+        }
+    }
+    if (outDir.empty() || !dirExists(outDir)) {
+
+        size_t pos = filePathInput.find_last_of("/\\");
+        outDir = (pos == std::string::npos) ? "." : filePathInput.substr(0, pos);
+    }
+
+    outDir = MakeAbsolutePath(outDir);
 
 	// debug default file path
     //if (filePathInput.empty()) filePathInput = "./KP_L_R_area3.bin";
@@ -628,23 +683,37 @@ int main(int argc, char* argv[])
     std::ifstream fs(filePathInput, std::ios::binary);
     if (!fs) {
         std::cerr << "Failed to open file: " << filePathInput << "\n";
-        system("pause");
+        std::ofstream(logPath.c_str(), std::ios::trunc) << "Error: failed to open input file";
+        //system("pause");
         return 1;
     }
 
     std::string ext = filePathInput.substr(filePathInput.find_last_of('.'));
     if (ext == ".bin")
     {
+        for (int i = 2; i < argc; i++) {
+            if (strcmp(argv[i], "m") == 0) {
+                mergeOn = true;
+				std::cout << "Merging enabled\n";
+            }
+        }
         // FIRE LOGO PRINT
         FireLogoPrint(56);
 
         MKDXData data = LoadMKDXFile(fs);
 
-        SaveDaeFile(filePathInput, data.headerData, data.materialsData, data.textureNames, data.nodeLinks, data.allNodeNames, data.rootNodes, data.fullNodeDataList, arg2 == "m");
+        SaveDaeFile(filePathInput, outDir, data.headerData, data.materialsData, data.textureNames, data.nodeLinks, data.allNodeNames, data.rootNodes, data.fullNodeDataList, mergeOn);
         //SaveMKDXFile(filePathInput, data.headerData, data.materialsData, data.textureNames, data.boneNames, data.nodeLinks, data.allNodeNames, data.rootNodes, data.fullNodeDataList); // debug remake file
     }
     else if (ext == ".dae")
     {
+        for (int i = 2; i < argc; i++) {
+            std::string arg = argv[i];
+            if (arg.size() > 4 && arg.substr(arg.size() - 4) == ".txt") {
+                txtFilePath = arg;
+                break;
+            }
+        }
         // FIRE LOGO PRINT
         FireLogoPrint(56);
 
@@ -655,7 +724,8 @@ int main(int argc, char* argv[])
 
         if (!scene || !scene->HasMeshes()) {
             std::cerr << "failed to load scene or no meshes found\n";
-            system("pause");
+            std::ofstream(logPath.c_str(), std::ios::trunc) << "Error: failed to load scene or no meshes found";
+            //system("pause");
             return 1;
         }
 
@@ -679,13 +749,19 @@ int main(int argc, char* argv[])
 
         std::cout << "\nExpected number of materials in preset file: " << scene->mNumMaterials << "\n";
         std::string presetPath;
-        if (!arg2.empty() && arg2.size() >= 4 && arg2.substr(arg2.size() - 4) == ".txt") {
-            std::ifstream testFile(arg2);
-            if (testFile.good()) presetPath = arg2;
+        if (!txtFilePath.empty() && txtFilePath.size() >= 4 && txtFilePath.substr(txtFilePath.size() - 4) == ".txt") {
+            std::ifstream testFile(txtFilePath);
+            if (testFile.good()) presetPath = txtFilePath;
         }
         if (presetPath.empty()) {
-            std::cout << "Enter material preset txt file path (leave blank to generate default): ";
-            std::getline(std::cin, presetPath);
+			if (outDirEmpty) {
+                std::cout << "Enter material preset txt file path (leave blank to generate default): ";
+                std::getline(std::cin, presetPath);
+			}
+            else {
+                std::ofstream(logPath.c_str(), std::ios::trunc) << "Error: invalid material preset txt";
+                return 1;
+            }
         }
 
         //presetPath = "RosalinaPreset.txt"; // debug path
@@ -725,11 +801,11 @@ int main(int argc, char* argv[])
         else {
             std::cout << "Using material preset file: " << presetPath << "\n";
 
-
             std::ifstream presetFile(presetPath);
             if (!presetFile) {
                 std::cerr << "failed to open preset file: " << presetPath << "\n";
-                system("pause");
+                std::ofstream(logPath.c_str(), std::ios::trunc) << "Error: failed to open preset file";
+                //system("pause");
                 return 1;
             }
 
@@ -749,7 +825,7 @@ int main(int argc, char* argv[])
                     }
                 }
                 return true;
-            };
+                };
 
             auto readInt = [&](std::istringstream& s, int& dst) {
                 if (!(s >> dst)) {
@@ -757,78 +833,90 @@ int main(int argc, char* argv[])
                     return false;
                 }
                 return true;
-            };
+                };
 
             std::map<std::string, std::array<float, 6>> animFloatMap;
             MaterialPreset currentMat;
-            while (std::getline(presetFile, line)) {
-                ++lineNumber;
-                if (line.empty()) continue;
-                if (line[0] == '/' || line[0] == ' ') continue;
+            bool haveMaterial = false;
+            try {
+                while (std::getline(presetFile, line)) {
+                    ++lineNumber;
+                    if (line.empty()) continue;
+                    if (line[0] == '/' || line[0] == ' ') continue;
 
-                std::istringstream iss(line);
-                std::string tag;
-                iss >> tag;
+                    std::istringstream iss(line);
+                    std::string tag;
+                    iss >> tag;
 
-                if (tag == "#Material") {
-                    if (!materials.empty() || lineNumber != 1) {
-                        materials.push_back(currentMat);
+                    if (tag == "#Material") {
+                        if (!materials.empty() || lineNumber != 1) {
+                            materials.push_back(currentMat);
+                        }
+                        currentMat = MaterialPreset();
+                        haveMaterial = true;
+                        inTextures = false;
+                        inMeshes = false;
+                        continue;
                     }
-                    currentMat = MaterialPreset();
-                    inTextures = false;
-                    inMeshes = false;
-                    continue;
-                }
 
-                if (tag == "#AnimFloats") {
-                    std::string boneName;
-                    float v0, v1, v2, v3, v4, v5;
-                    if (iss >> boneName >> v0 >> v1 >> v2 >> v3 >> v4 >> v5) {
-                        animFloatMap[boneName] = { v0, v1, v2, v3, v4, v5 };
+                    if (tag == "#AnimFloats") {
+                        std::string boneName;
+                        float v0, v1, v2, v3, v4, v5;
+                        if (iss >> boneName >> v0 >> v1 >> v2 >> v3 >> v4 >> v5) {
+                            animFloatMap[boneName] = { v0, v1, v2, v3, v4, v5 };
+                        }
+                        else {
+                            printf("Invalid #AnimFloats line on %d\n", lineNumber);
+                        }
+                        continue;
                     }
-                    else {
-                        printf("Invalid #AnimFloats line on %d\n", lineNumber);
+
+                    if (tag == "#Textures") {
+                        inTextures = true;
+                        inMeshes = false;
+                        continue;
                     }
-                    continue;
-                }
+                    if (tag == "#Meshes") {
+                        inTextures = false;
+                        inMeshes = true;
+                        continue;
+                    }
 
-                if (tag == "#Textures") {
-                    inTextures = true;
-                    inMeshes = false;
-                    continue;
-                }
-                if (tag == "#Meshes") {
-                    inTextures = false;
-                    inMeshes = true;
-                    continue;
-                }
-                
-                // if line starts with # then not reading names anymore
-                if (inTextures) {
-                    if (tag[0] == '#') inTextures = false;
-                    else textureNames.push_back({ line, 0 }); // 0 for NamePointer for now
-                    continue;
-                }
-                if (inMeshes) {
-                    if (tag[0] == '#') inMeshes = false;
-                    else meshList.push_back(line);
-                    continue;
-                }
+                    // if line starts with # then not reading names anymore
+                    if (inTextures) {
+                        if (tag[0] == '#') inTextures = false;
+                        else textureNames.push_back({ line, 0 }); // 0 for NamePointer for now
+                        continue;
+                    }
+                    if (inMeshes) {
+                        if (tag[0] == '#') inMeshes = false;
+                        else meshList.push_back(line);
+                        continue;
+                    }
 
-                if (tag == "#DIFFUSE") readFloats(iss, currentMat.diffuse, 4);
-                else if (tag == "#SPECULAR") readFloats(iss, currentMat.specular, 4);
-                else if (tag == "#AMBIENCE") readFloats(iss, currentMat.ambience, 4);
-                else if (tag == "#SHINY") readFloats(iss, &currentMat.shiny, 1);
-                else if (tag == "#TEXALBEDO") readInt(iss, currentMat.texAlbedo);
-                else if (tag == "#TEXSPECULAR") readInt(iss, currentMat.texSpecular);
-                else if (tag == "#TEXREFLECTIVE") readInt(iss, currentMat.texReflective);
-                else if (tag == "#TEXENVIRONMENT") readInt(iss, currentMat.texEnvironment);
-                else if (tag == "#TEXNORMAL") readInt(iss, currentMat.texNormal);
-                else if (tag == "#UNKNOWN") readInt(iss, currentMat.unknownVal);
-                else if (tag == "#UNKNOWN2") readFloats(iss, &currentMat.unknownVal2, 1);
-                else std::cerr << "line " << lineNumber << ": unknown tag: " << tag << "\n";
+                    if (tag == "#DIFFUSE") readFloats(iss, currentMat.diffuse, 4);
+                    else if (tag == "#SPECULAR") readFloats(iss, currentMat.specular, 4);
+                    else if (tag == "#AMBIENCE") readFloats(iss, currentMat.ambience, 4);
+                    else if (tag == "#SHINY") readFloats(iss, &currentMat.shiny, 1);
+                    else if (tag == "#TEXALBEDO") readInt(iss, currentMat.texAlbedo);
+                    else if (tag == "#TEXSPECULAR") readInt(iss, currentMat.texSpecular);
+                    else if (tag == "#TEXREFLECTIVE") readInt(iss, currentMat.texReflective);
+                    else if (tag == "#TEXENVIRONMENT") readInt(iss, currentMat.texEnvironment);
+                    else if (tag == "#TEXNORMAL") readInt(iss, currentMat.texNormal);
+                    else if (tag == "#UNKNOWN") readInt(iss, currentMat.unknownVal);
+                    else if (tag == "#UNKNOWN2") readFloats(iss, &currentMat.unknownVal2, 1);
+                    else std::cerr << "line " << lineNumber << ": unknown tag: " << tag << "\n";
+                }
+                if (haveMaterial) {
+                    materials.push_back(currentMat);
+                }
             }
-            materials.push_back(currentMat);
+            catch (const std::exception& e) {
+                std::string errMsg = std::string("Exception while reading preset file at line ") + std::to_string(lineNumber) + ": " + e.what() + "\n";
+                std::cerr << errMsg;
+                std::ofstream(logPath.c_str(), std::ios::app) << errMsg;
+                return 1;
+            }
 
             if (textureNames.size() == 0) {
                 std::cerr << "no #Textures block found\n";
@@ -846,8 +934,11 @@ int main(int argc, char* argv[])
                 }
             }
             if (materials.size() != scene->mNumMaterials + dummyMat) {
-                std::cerr << "Error: expected " << scene->mNumMaterials << " materials, but loaded " << materials.size() << " from preset\n";
-                system("pause");
+                std::string errMsg = "Error: expected " + std::to_string(scene->mNumMaterials) +
+                    " materials, but loaded " + std::to_string(materials.size()) + " from preset\n";
+                std::cerr << errMsg;
+                std::ofstream(logPath.c_str(), std::ios::trunc) << errMsg;
+                //system("pause");
                 return 1;
             }
             std::cout << "loaded " << materials.size() << " materials, " << textureNames.size() << " textures, and " << meshList.size() << " meshes" << "\n";
@@ -1405,16 +1496,18 @@ int main(int argc, char* argv[])
 
             check.close();
 
-            SaveMKDXFile(filePathInput, headerData, materialsData, textureNames, boneNames, nodeLinks, allNodeNames, rootNodes, fullNodeDataList);
+			//std::cout << outDir << " is the output directory\n";
+            SaveMKDXFile(filePathInput, outDir, headerData, materialsData, textureNames, boneNames, nodeLinks, allNodeNames, rootNodes, fullNodeDataList);
             std::remove(filePathInput.c_str()); // remove tmp file
         }
 	}
     else {
 	    std::cerr << "eyyooo mai bruther, '" << ext << "' this file idk wtf are this welcome to the thanos world\n";
-	    system("pause");
+		std::ofstream(logPath.c_str(), std::ios::trunc) << "Error: unsupported file extension '" + ext + "'";
+	    //system("pause");
 	    return 1;
 	}
 
-    system("pause");
+    //system("pause");
     return 0;
 }
