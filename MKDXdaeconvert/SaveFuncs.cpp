@@ -649,7 +649,7 @@ void SaveDaeFile(const std::string& path, Header& headerData, std::vector<Materi
         }
     }
 
-    // create bones with weights on new mesh
+    // create bones with weights on new mesh(es)
 
     for (size_t nodeIndex = 0; nodeIndex < fullNodeDataList.size(); nodeIndex++) {
         const auto& nodeData = fullNodeDataList[nodeIndex];
@@ -1077,23 +1077,22 @@ void SaveMKDXFile(const std::string& path, Header& header, std::vector<Material>
     }
 
     // Update all pointers in out file (seek to variables that start with 'pos')
-    writer.seekp(posMaterialArrayOffset);
-    writer.write(reinterpret_cast<char*>(&materialArrayOffset), sizeof(uint32_t));
+    if (header.MaterialCount)
+        writer.seekp(posMaterialArrayOffset), writer.write(reinterpret_cast<char*>(&materialArrayOffset), sizeof(uint32_t));
 
-    writer.seekp(posTextureNameArrayOffset);
-    writer.write(reinterpret_cast<char*>(&posTextureNameArray), sizeof(uint32_t));
+    if (header.TextureMapsCount)
+        writer.seekp(posTextureNameArrayOffset), writer.write(reinterpret_cast<char*>(&posTextureNameArray), sizeof(uint32_t));
 
-    writer.seekp(posBoneNameArrayOffset);
-    writer.write(reinterpret_cast<char*>(&posBoneNamesArray), sizeof(uint32_t));
+    if (header.BoneCount)
+        writer.seekp(posBoneNameArrayOffset), writer.write(reinterpret_cast<char*>(&posBoneNamesArray), sizeof(uint32_t));
 
-    writer.seekp(posRootNodeArrayOffset);
-    writer.write(reinterpret_cast<char*>(&posRootNodeArray), sizeof(uint32_t));
+    writer.seekp(posRootNodeArrayOffset), writer.write(reinterpret_cast<char*>(&posRootNodeArray), sizeof(uint32_t));
 
-    writer.seekp(posLinkNodeOffset);
-    writer.write(reinterpret_cast<char*>(&posLinkNodeArray), sizeof(uint32_t));
+    if (header.LinkNodeCount)
+        writer.seekp(posLinkNodeOffset), writer.write(reinterpret_cast<char*>(&posLinkNodeArray), sizeof(uint32_t));
 
-    writer.seekp(posTotalNodeArrayOffset);
-    writer.write(reinterpret_cast<char*>(&posAllNodeNamesArray), sizeof(uint32_t));
+    if (header.TotalNodeCount)
+        writer.seekp(posTotalNodeArrayOffset), writer.write(reinterpret_cast<char*>(&posAllNodeNamesArray), sizeof(uint32_t));
 
     writer.seekp(posTextureNameArray);
     for (size_t i = 0; i < textureNames.size(); i++)

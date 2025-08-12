@@ -168,7 +168,7 @@ std::string CloneAndFixFBXASC(const std::string& originalPath) {
     }
     out << content;
     out.close();
-
+    //system("pause");
     return tempPath;
 }
 
@@ -270,6 +270,25 @@ std::unordered_map<std::string, int> CallGetMaterialIndicesFromDLL(const std::st
 
     FreeLibrary(dll);
     return meshToMaterial;
+}
+
+typedef void(__cdecl* PatchDaePreImportFunc)(const char*, const char*);
+
+void CallPatchDaePreImportFromDLL(const std::string& path, const std::string& groupsFile)
+{
+    HMODULE dll = LoadLibraryA("tinyxml2patcher.dll");
+    if (!dll) {
+        std::cerr << "Failed to load tinyxml2patcher.dll" << std::endl;
+        return;
+    }
+    PatchDaePreImportFunc patchFunc = (PatchDaePreImportFunc)GetProcAddress(dll, "PatchDaePreImport_C");
+    if (!patchFunc) {
+        std::cerr << "Failed to find PatchDaePreImport_C in DLL" << std::endl;
+        FreeLibrary(dll);
+        return;
+    }
+    patchFunc(path.c_str(), groupsFile.c_str());
+    FreeLibrary(dll);
 }
 
 // all funcs to use the structs in coolstructs.h
@@ -586,7 +605,7 @@ MKDXData LoadMKDXFile(std::ifstream& fs)
 int main(int argc, char* argv[])
 {
     std::cout << "\033[34mVery epic mkagpdx dae tool\033[37m\n";
-    std::cout << "Cool tool for some exports and soon some imports too\n\n";
+    std::cout << "Cool tool for some exports and imports\n\n";
 
     // get exe directory
     std::string filePathInput;
@@ -596,13 +615,12 @@ int main(int argc, char* argv[])
 
 	// debug default file path
     //if (filePathInput.empty()) filePathInput = "./KP_L_R_area3.bin";
-    //if (filePathInput.empty()) filePathInput = "./rosetta_model.bin";
-    //if (filePathInput.empty()) { filePathInput = "./rosettablender.dae"; arg2 = "./RosettaPreset.txt"; } else 
-    //arg2 = "n";
+    //if (filePathInput.empty()) filePathInput = "C:/Users/Blurro/Desktop/My Stuff/Games/Emulation/MarioKartArcadeGPDX/Mario Kart DX 1.18/Data/Model/driver/rosetta/rosetta_model og_out.dae";
+    //if (filePathInput.empty()) { filePathInput = "C:/Users/Blurro/source/repos/MKDXdaeconvert/x64/Debug/brian/briannn.dae"; arg2 = "C:/Users/Blurro/source/repos/MKDXdaeconvert/x64/Debug/brian/BrianPreset.txt"; }
 
     if (filePathInput.empty()) {
         std::cout << "Usage for dae export: Drag and drop a .bin file onto the tool (in file explorer, not this window)\nOptional add \"m\" arg to merge submeshes into full meshes\nExample cmd command 'MKDXTool mario_model.bin m'\n";
-		std::cout << "\nUsage for mkdx bin file creation: Drag and drop a .dae file onto the tool, then enter your material preset path.\nOptional add material preset path arg to skip the prompt\nExample cmd command 'MKDXTool mario_model.dae mario_materials.txt'\n\n";
+		std::cout << "\nUsage for mkdx bin file creation: Drag and drop a .dae file onto the tool, then enter your material preset path.\nOptional add material preset path arg to skip the prompt\nExample cmd command 'MKDXTool mario_model.dae MarioPreset.txt'\n\n";
         system("pause");
         return 0;
     }
@@ -834,8 +852,12 @@ int main(int argc, char* argv[])
             }
             std::cout << "loaded " << materials.size() << " materials, " << textureNames.size() << " textures, and " << meshList.size() << " meshes" << "\n";
 
+            // func that splits meshes into submeshes based on bone counts per triangle
+            CallPatchDaePreImportFromDLL(filePathInput, "final_groups.t");
+
             // modify dae.tmp file to treat non-listed child mesh nodes of a listed mesh node as being submeshes of that listed mesh
             CallNodeToSubmeshFromDLL(filePathInput, meshList);
+            
             // reload scene
             scene = importer.ReadFile(filePathInput, aiProcess_Triangulate | aiProcess_JoinIdenticalVertices);
 
@@ -854,24 +876,37 @@ int main(int argc, char* argv[])
             aiNode* root = scene->mRootNode;
 
             // always skip the first node (scene), then skip "Armature" if present
+            std::vector<aiNode*> nodesToProcess;
             if (root) {
-                std::cout << "Skipping top-level root node \"" << root->mName.C_Str() << "\" with " << root->mNumChildren << " child(ren)\n";
-                if (root->mNumChildren == 1)
-                    root = root->mChildren[0];
-                else
-                    root = nullptr;
-            }
-            if (root && (root->mName == aiString("Armature"))) {
-                std::cout << "Skipping node \"Armature\" with " << root->mNumChildren << " child(ren)\n";
-                if (root->mNumChildren == 1)
-                    root = root->mChildren[0];
-                else
-                    root = nullptr;
+                std::cout << "Top-level root node: \"" << root->mName.C_Str() << "\" with " << root->mNumChildren << " child(ren)\n";
+
+                aiNode* armatureNode = nullptr;
+                for (unsigned int i = 0; i < root->mNumChildren; ++i) {
+                    aiNode* child = root->mChildren[i];
+                    std::string name = child->mName.C_Str();
+                    std::cout << "  child[" << i << "] = " << name << "\n";
+
+                    if (name == "Armature") {
+                        armatureNode = child;
+                        break;
+                    }
+                }
+                if (armatureNode) {
+                    std::cout << "Found \"Armature\" node with " << armatureNode->mNumChildren << " child(ren). Processing those.\n";
+                    for (unsigned int i = 0; i < armatureNode->mNumChildren; ++i)
+                        nodesToProcess.push_back(armatureNode->mChildren[i]);
+                }
+                else {
+                    std::cout << "No \"Armature\" found. Processing children of Scene root directly.\n";
+                    for (unsigned int i = 0; i < root->mNumChildren; ++i)
+                        nodesToProcess.push_back(root->mChildren[i]);
+                }
             }
 
-			std::vector<aiNode*> allAiNodes; // rearranged nodes to match the order of fullNodeDataList
-            stack.push_back(root);
+            for (aiNode* n : nodesToProcess)
+                stack.push_back(n);
 
+            std::vector<aiNode*> allAiNodes; // rearranged nodes to match the order of fullNodeDataList
             while (!stack.empty()) {
                 aiNode* node = stack.back();
                 allAiNodes.push_back(node);

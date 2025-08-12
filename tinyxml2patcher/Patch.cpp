@@ -8,6 +8,10 @@
 #include <unordered_set>
 #include <map>
 #include <set>
+#include <stdio.h>
+#include <stdlib.h>
+#include <array>
+#include <algorithm>
 using namespace tinyxml2;
 
 struct Vec3 {
@@ -277,6 +281,165 @@ extern "C" __declspec(dllexport) void __cdecl PatchDaeFile_C(const char* filePat
         }
     }
 
+	// cool block to merge vertices with the same position
+    for (auto geometry = libGeometries->FirstChildElement("geometry"); geometry; geometry = geometry->NextSiblingElement("geometry")) {
+        auto mesh = geometry->FirstChildElement("mesh");
+        if (!mesh) continue;
+
+        for (auto tri = mesh->FirstChildElement("triangles"); tri; tri = tri->NextSiblingElement("triangles")) {
+            for (auto input = tri->FirstChildElement("input"); input; input = input->NextSiblingElement("input")) {
+                const char* semantic = input->Attribute("semantic");
+                if (!semantic) continue;
+                if (std::string(semantic) == "TEXCOORD") input->SetAttribute("offset", 1);
+                else input->SetAttribute("offset", 0);
+            }
+
+            auto p = tri->FirstChildElement("p");
+            if (!p || !p->GetText()) continue;
+
+            std::stringstream ss(p->GetText());
+            std::vector<unsigned int> doubled;
+            unsigned int val;
+            while (ss >> val) {
+                doubled.push_back(val);
+                doubled.push_back(val);
+            }
+
+            std::stringstream doubledSS;
+            for (auto v : doubled) doubledSS << v << " ";
+            std::string doubledStr = doubledSS.str();
+            if (!doubledStr.empty()) doubledStr.pop_back();
+            p->SetText(doubledStr.c_str());
+
+            auto vertices = mesh->FirstChildElement("vertices");
+            if (!vertices) continue;
+            std::string posSourceId;
+            for (auto input = vertices->FirstChildElement("input"); input; input = input->NextSiblingElement("input")) {
+                if (std::string(input->Attribute("semantic")) == "POSITION") {
+                    posSourceId = input->Attribute("source");
+                    if (posSourceId[0] == '#') posSourceId = posSourceId.substr(1);
+                    break;
+                }
+            }
+            if (posSourceId.empty()) continue;
+
+            tinyxml2::XMLElement* posSourceElem = nullptr;
+            for (auto source = mesh->FirstChildElement("source"); source; source = source->NextSiblingElement("source")) {
+                if (std::string(source->Attribute("id")) == posSourceId) {
+                    posSourceElem = source;
+                    break;
+                }
+            }
+            if (!posSourceElem) continue;
+
+            auto floatArray = posSourceElem->FirstChildElement("float_array");
+            if (!floatArray) continue;
+
+            std::stringstream fss(floatArray->GetText());
+            std::vector<float> positions;
+            float f;
+            while (fss >> f) positions.push_back(f);
+
+            auto technique = posSourceElem->FirstChildElement("technique_common");
+            if (!technique) continue;
+            auto accessor = technique->FirstChildElement("accessor");
+            if (!accessor || !accessor->Attribute("stride")) continue;
+            int posStride = atoi(accessor->Attribute("stride"));
+
+            // load normals too
+            std::string normSourceId;
+            for (auto input = tri->FirstChildElement("input"); input; input = input->NextSiblingElement("input")) {
+                if (std::string(input->Attribute("semantic")) == "NORMAL") {
+                    normSourceId = input->Attribute("source");
+                    if (normSourceId[0] == '#') normSourceId = normSourceId.substr(1);
+                    break;
+                }
+            }
+
+            std::vector<float> normals;
+            int normStride = 0;
+            if (!normSourceId.empty()) {
+                tinyxml2::XMLElement* normSourceElem = nullptr;
+                for (auto source = mesh->FirstChildElement("source"); source; source = source->NextSiblingElement("source")) {
+                    if (std::string(source->Attribute("id")) == normSourceId) {
+                        normSourceElem = source;
+                        break;
+                    }
+                }
+                if (normSourceElem) {
+                    auto normArray = normSourceElem->FirstChildElement("float_array");
+                    if (normArray) {
+                        std::stringstream nss(normArray->GetText());
+                        float nf;
+                        while (nss >> nf) normals.push_back(nf);
+                    }
+                    auto ntech = normSourceElem->FirstChildElement("technique_common");
+                    if (ntech) {
+                        auto naccessor = ntech->FirstChildElement("accessor");
+                        if (naccessor && naccessor->Attribute("stride")) normStride = atoi(naccessor->Attribute("stride"));
+                    }
+                }
+            }
+
+            std::stringstream pss(p->GetText());
+            std::vector<unsigned int> indices;
+            unsigned int idx;
+            while (pss >> idx) indices.push_back(idx);
+
+            int inputCount = 2;
+
+            std::unordered_map<unsigned int, unsigned int> canonicalMap;
+            for (unsigned int i = 0; i < positions.size() / posStride; ++i) {
+                canonicalMap[i] = i;
+            }
+
+            auto equalPosAndNorm = [&](unsigned int i, unsigned int j) {
+                for (int k = 0; k < posStride; ++k)
+                    if (fabs(positions[i * posStride + k] - positions[j * posStride + k]) > 1e-5f) return false;
+
+                if (normStride > 0) {
+                    for (size_t triIdx = 0; triIdx < indices.size(); triIdx += inputCount) {
+                        if (indices[triIdx] == i && indices[triIdx + 1] && indices[triIdx + 1] < normals.size() / normStride) {
+                            for (size_t searchIdx = 0; searchIdx < indices.size(); searchIdx += inputCount) {
+                                if (indices[searchIdx] == j && indices[searchIdx + 1] && indices[searchIdx + 1] < normals.size() / normStride) {
+                                    for (int k = 0; k < normStride; ++k) {
+                                        float ni = normals[indices[triIdx + 1] * normStride + k];
+                                        float nj = normals[indices[searchIdx + 1] * normStride + k];
+                                        if (fabs(ni - nj) > 1e-5f) return false;
+                                    }
+                                    return true;
+                                }
+                            }
+                        }
+                    }
+                    return false;
+                }
+
+                return true;
+            };
+
+            for (unsigned int i = 0; i < positions.size() / posStride; ++i) {
+                for (unsigned int j = i + 1; j < positions.size() / posStride; ++j) {
+                    if (equalPosAndNorm(i, j) && canonicalMap[j] == j) {
+                        canonicalMap[j] = canonicalMap[i];
+                    }
+                }
+            }
+
+            for (size_t triIdx = 0; triIdx < indices.size(); triIdx += inputCount) {
+                unsigned int vertexIndex = indices[triIdx];
+                unsigned int canonicalIndex = canonicalMap[vertexIndex];
+                indices[triIdx] = canonicalIndex;
+            }
+
+            std::stringstream outSS;
+            for (auto i : indices) outSS << i << " ";
+            std::string outStr = outSS.str();
+            if (!outStr.empty()) outStr.pop_back();
+            p->SetText(outStr.c_str());
+        }
+    }
+
     doc.SaveFile(filePath);
 }
 
@@ -417,7 +580,6 @@ extern "C" __declspec(dllexport) void __cdecl GetDaeNormals_C(const char* filePa
 
     // kickoff
     py << "maya.utils.executeDeferred(apply_normals_0)\n";
-
 
     py.close();
 
@@ -924,16 +1086,16 @@ struct MaterialIndicesContext {
 
 void VisitNodeRecursive(tinyxml2::XMLElement* node, MaterialIndicesContext& ctx) {
     const char* nodeId = node->Attribute("id");
-    printf("visiting node: %s\n", nodeId ? nodeId : "<unnamed>");
+    //printf("visiting node: %s\n", nodeId ? nodeId : "<unnamed>");
 
     auto* instGeom = node->FirstChildElement("instance_geometry");
     if (instGeom && ctx.count < ctx.maxEntries) {
         const char* geomUrl = instGeom->Attribute("url");
-        printf("  found instance_geometry: url=%s\n", geomUrl ? geomUrl : "<null>");
+        //printf("  found instance_geometry: url=%s\n", geomUrl ? geomUrl : "<null>");
 
         if (geomUrl && geomUrl[0] == '#') {
             std::string meshName = geomUrl + 1;
-            printf("  mesh name: %s\n", meshName.c_str());
+            //printf("  mesh name: %s\n", meshName.c_str());
 
             auto* bindMat = instGeom->FirstChildElement("bind_material");
             if (bindMat) {
@@ -942,7 +1104,7 @@ void VisitNodeRecursive(tinyxml2::XMLElement* node, MaterialIndicesContext& ctx)
                     auto* instMat = techCommon->FirstChildElement("instance_material");
                     if (instMat) {
                         const char* matTarget = instMat->Attribute("target");
-                        printf("  instance_material target: %s\n", matTarget ? matTarget : "<null>");
+                        //printf("  instance_material target: %s\n", matTarget ? matTarget : "<null>");
 
                         if (matTarget && matTarget[0] == '#') {
                             std::string matId = matTarget + 1;
@@ -955,12 +1117,12 @@ void VisitNodeRecursive(tinyxml2::XMLElement* node, MaterialIndicesContext& ctx)
                                 }
                             }
 
-                            printf("  resolved matId: %s to matIndex: %d\n", matId.c_str(), matIndex);
+                            //printf("  resolved matId: %s to matIndex: %d\n", matId.c_str(), matIndex);
 
                             if (matIndex >= 0) {
                                 strncpy_s(ctx.outMeshNames[ctx.count], 256, meshName.c_str(), _TRUNCATE);
                                 ctx.outMaterialIndices[ctx.count] = matIndex;
-                                printf("  stored: mesh=%s, index=%d\n", meshName.c_str(), matIndex);
+                                //printf("  stored: mesh=%s, index=%d\n", meshName.c_str(), matIndex);
                                 ++ctx.count;
                             }
                         }
@@ -974,21 +1136,13 @@ void VisitNodeRecursive(tinyxml2::XMLElement* node, MaterialIndicesContext& ctx)
         VisitNodeRecursive(child, ctx);
 }
 
-extern "C" __declspec(dllexport)
-void __cdecl GetMaterialIndices_C(
+extern "C" __declspec(dllexport) void __cdecl GetMaterialIndices_C(
     const char* filePath,
     char** outMeshNames,
     int* outMaterialIndices,
     int maxEntries,
     int* outCount)
 {
-    printf("GetMaterialIndices_C called\n");
-    printf("  filePath: %s\n", filePath ? filePath : "<null>");
-    printf("  outMeshNames: %p\n", outMeshNames);
-    printf("  outMaterialIndices: %p\n", outMaterialIndices);
-    printf("  maxEntries: %d\n", maxEntries);
-    printf("  outCount: %p\n", outCount);
-
     *outCount = 0;
     if (!filePath || !outMeshNames || !outMaterialIndices || !outCount) return;
 
@@ -1009,7 +1163,7 @@ void __cdecl GetMaterialIndices_C(
         for (auto* mat = libMaterials->FirstChildElement("material"); mat; mat = mat->NextSiblingElement("material")) {
             const char* id = mat->Attribute("id");
             ctx.materialIDs.push_back(id ? id : "");
-            printf("  found material id: %s\n", id ? id : "<null>");
+            //printf("  found material id: %s\n", id ? id : "<null>");
         }
     }
 
@@ -1024,4 +1178,595 @@ void __cdecl GetMaterialIndices_C(
 
     *outCount = ctx.count;
     printf("  total materials assigned: %d\n", ctx.count);
+}
+
+static void splitString(const std::string& s, char delim, std::vector<std::string>& out) {
+    out.clear();
+    std::stringstream ss(s);
+    std::string item;
+    while (std::getline(ss, item, delim)) {
+        out.push_back(item);
+    }
+}
+
+extern "C" __declspec(dllexport) void __cdecl PatchDaePreImport_C(const char* daePath, const char* groupsPath)
+{
+    struct FinalGroup {
+        std::string meshName;
+        std::vector<unsigned int> triangles;
+    };
+    std::vector<FinalGroup> finalGroups;
+
+    //printf("[dae-scan] loading DAE: %s\n", daePath);
+    tinyxml2::XMLDocument doc;
+    if (doc.LoadFile(daePath) != tinyxml2::XML_SUCCESS) {
+        printf("[dae-scan] failed to load DAE\n");
+        return;
+    }
+
+    tinyxml2::XMLElement* root = doc.RootElement();
+    if (!root) {
+        printf("[dae-scan] no root element\n");
+        return;
+    }
+
+    tinyxml2::XMLElement* libGeoms = root->FirstChildElement("library_geometries");
+    tinyxml2::XMLElement* libCtrls = root->FirstChildElement("library_controllers");
+    if (!libGeoms) {
+        printf("[dae-scan] no library_geometries\n");
+        return;
+    }
+    if (!libCtrls) {
+        printf("[dae-scan] no library_controllers (no skin info)\n");
+    }
+
+    // turn polylist block to triangles
+    for (auto mesh = doc.FirstChildElement("COLLADA")
+        ->FirstChildElement("library_geometries")
+        ->FirstChildElement("geometry");
+        mesh;
+        mesh = mesh->NextSiblingElement("geometry")) {
+
+        auto meshElem = mesh->FirstChildElement("mesh");
+        if (!meshElem) continue;
+
+        for (auto polylist = meshElem->FirstChildElement("polylist"); polylist;) {
+            auto next = polylist->NextSiblingElement("polylist");
+
+            // change tag name to triangles
+            auto triangles = doc.NewElement("triangles");
+
+            // copy all attributes
+            const tinyxml2::XMLAttribute* attr = polylist->FirstAttribute();
+            while (attr) {
+                triangles->SetAttribute(attr->Name(), attr->Value());
+                attr = attr->Next();
+            }
+
+            // move children except <vcount>
+            for (auto child = polylist->FirstChildElement(); child;) {
+                auto nextChild = child->NextSiblingElement();
+                if (std::string(child->Name()) != "vcount")
+                    triangles->InsertEndChild(child->DeepClone(&doc));
+                child = nextChild;
+            }
+
+            // replace in tree
+            meshElem->InsertAfterChild(polylist, triangles);
+            meshElem->DeleteChild(polylist);
+
+            polylist = next;
+        }
+    }
+
+    // Build map: geometryId -> per-vertex bone weight map (vertexIndex -> map<boneName,weight>)
+    std::unordered_map<std::string, std::unordered_map<unsigned int, std::unordered_map<std::string, float>>> boneWeightsPerGeometry;
+    //printf("[dae-scan] scanning controllers for skin weights...\n");
+    for (tinyxml2::XMLElement* ctrl = libCtrls->FirstChildElement("controller"); ctrl; ctrl = ctrl->NextSiblingElement("controller")) {
+        tinyxml2::XMLElement* skin = ctrl->FirstChildElement("skin");
+        if (!skin) continue;
+        const char* srcAttr = skin->Attribute("source");
+        if (!srcAttr) continue;
+        if (srcAttr[0] != '#') continue;
+        std::string geomId = std::string(srcAttr + 1);
+        //printf("[dae-scan] controller -> skin for geometry id: %s\n", geomId.c_str());
+
+        // find <vertex_weights>
+        tinyxml2::XMLElement* vw = skin->FirstChildElement("vertex_weights");
+        if (!vw) {
+            printf("[dae-scan]  no vertex_weights for %s, skipping skin\n", geomId.c_str());
+            continue;
+        }
+
+        // parse inputs in vertex_weights to find JOINT and WEIGHT source ids and offsets
+        int maxOffset = -1;
+        std::string jointSourceId;
+        std::string weightSourceId;
+        std::unordered_map<std::string, int> vwInputOffset;
+        for (tinyxml2::XMLElement* in = vw->FirstChildElement("input"); in; in = in->NextSiblingElement("input")) {
+            const char* sem = in->Attribute("semantic");
+            const char* src = in->Attribute("source");
+            int off = in->IntAttribute("offset", 0);
+            if (!sem || !src) continue;
+            if (off > maxOffset) maxOffset = off;
+            vwInputOffset[std::string(sem)] = off;
+            if (src[0] == '#') {
+                std::string s = std::string(src + 1);
+                if (std::string(sem) == "JOINT") jointSourceId = s;
+                else if (std::string(sem) == "WEIGHT") weightSourceId = s;
+            }
+        }
+        int vwStride = (maxOffset >= 0) ? (maxOffset + 1) : 1;
+        //printf("[dae-scan]  vertex_weights stride=%d jointSrc='%s' weightSrc='%s'\n", vwStride, jointSourceId.c_str(), weightSourceId.c_str());
+
+        // parse joint names from jointSourceId (a <source> containing a Name_array or similar)
+        std::vector<std::string> jointNames;
+        if (!jointSourceId.empty()) {
+            for (tinyxml2::XMLElement* s = skin->FirstChildElement("source"); s; s = s->NextSiblingElement("source")) {
+                const char* sid = s->Attribute("id");
+                if (!sid) continue;
+                if (std::string(sid) != jointSourceId) continue;
+                tinyxml2::XMLElement* nameArray = s->FirstChildElement("Name_array");
+                if (!nameArray) nameArray = s->FirstChildElement("name_array"); // fallback
+                if (!nameArray) continue;
+                const char* namesText = nameArray->GetText();
+                if (!namesText) continue;
+                std::stringstream ss(namesText);
+                std::string tok;
+                while (ss >> tok) {
+                    jointNames.push_back(tok);
+                }
+                //printf("[dae-scan]   parsed %zu joint names\n", jointNames.size());
+                break;
+            }
+        }
+
+        // parse weights floats from weightSourceId
+        std::vector<float> weightValues;
+        if (!weightSourceId.empty()) {
+            for (tinyxml2::XMLElement* s = skin->FirstChildElement("source"); s; s = s->NextSiblingElement("source")) {
+                const char* sid = s->Attribute("id");
+                if (!sid) continue;
+                if (std::string(sid) != weightSourceId) continue;
+                tinyxml2::XMLElement* fa = s->FirstChildElement("float_array");
+                if (!fa) continue;
+                const char* ft = fa->GetText();
+                if (!ft) continue;
+                std::stringstream ss(ft);
+                float fv;
+                while (ss >> fv) weightValues.push_back(fv);
+                //printf("[dae-scan]   parsed %zu weight floats\n", weightValues.size());
+                break;
+            }
+        }
+
+        // parse <vcount> and <v>
+        tinyxml2::XMLElement* vcountElem = vw->FirstChildElement("vcount");
+        tinyxml2::XMLElement* vElem = vw->FirstChildElement("v");
+        if (!vcountElem || !vElem) {
+            printf("[dae-scan]  vertex_weights missing vcount or v, skipping\n");
+            continue;
+        }
+        std::vector<int> vcounts;
+        {
+            const char* vcText = vcountElem->GetText();
+            if (vcText) {
+                std::stringstream ssv(vcText);
+                int vi;
+                while (ssv >> vi) vcounts.push_back(vi);
+            }
+        }
+        std::vector<unsigned int> vvals;
+        {
+            const char* vText = vElem->GetText();
+            if (vText) {
+                std::stringstream ssv(vText);
+                unsigned int vv;
+                while (ssv >> vv) vvals.push_back(vv);
+            }
+        }
+        //printf("[dae-scan]  vertex_weights vcount entries=%zu, v tokens=%zu\n", vcounts.size(), vvals.size());
+
+        // now iterate vertices and build per-vertex bone weights: jointIndex,weightIndex pairs per influence
+        std::unordered_map<unsigned int, std::unordered_map<std::string, float>> perVertexWeights;
+        size_t cursor = 0;
+        for (size_t vi = 0; vi < vcounts.size(); ++vi) {
+            int numInf = vcounts[vi];
+            for (int inf = 0; inf < numInf; ++inf) {
+                if (cursor + vwStride > vvals.size()) {
+                    printf("[dae-scan]   malformed v tokens, cursor out of range\n");
+                    break;
+                }
+                unsigned int jointIndexToken = 0;
+                unsigned int weightIndexToken = 0;
+                // find tokens by offset
+                std::unordered_map<std::string, int>::iterator itJointOff = vwInputOffset.find("JOINT");
+                std::unordered_map<std::string, int>::iterator itWeightOff = vwInputOffset.find("WEIGHT");
+                if (itJointOff != vwInputOffset.end()) {
+                    int offsetJoint = itJointOff->second;
+                    jointIndexToken = vvals[cursor + offsetJoint];
+                }
+                if (itWeightOff != vwInputOffset.end()) {
+                    int offsetWeight = itWeightOff->second;
+                    weightIndexToken = vvals[cursor + offsetWeight];
+                }
+                std::string boneName = "(unknown)";
+                if (jointIndexToken < jointNames.size()) boneName = jointNames[jointIndexToken];
+                float wval = 0.0f;
+                if (weightIndexToken < weightValues.size()) wval = weightValues[weightIndexToken];
+                if (wval != 0.0f) {
+                    perVertexWeights[(unsigned int)vi][boneName] += wval;
+                }
+                cursor += vwStride;
+            }
+        }
+        // store in global map
+        boneWeightsPerGeometry[geomId] = perVertexWeights;
+    //    printf("[dae-scan]  stored bone weights for geometry '%s' vertex-count=%zu\n", geomId.c_str(), perVertexWeights.size());
+    }
+
+    // Now iterate geometries and group triangles by bone sets
+    //printf("[dae-scan] scanning geometries and triangles...\n");
+    for (tinyxml2::XMLElement* geom = libGeoms->FirstChildElement("geometry"); geom; geom = geom->NextSiblingElement("geometry")) {
+        const char* geomIdC = geom->Attribute("id");
+        std::string geomId;
+        if (geomIdC) geomId = geomIdC;
+        else {
+            printf("[dae-scan] geometry without id, skipping\n");
+            continue;
+        }
+        tinyxml2::XMLElement* meshElem = geom->FirstChildElement("mesh");
+        if (!meshElem) {
+            printf("[dae-scan] geometry '%s' has no <mesh>, skipping\n", geomId.c_str());
+            continue;
+        }
+        //printf("[dae-scan] geometry '%s'\n", geomId.c_str());
+
+        size_t triGlobalOffset = 0;
+
+        for (tinyxml2::XMLElement* tri = meshElem->FirstChildElement("triangles"); tri; tri = tri->NextSiblingElement("triangles")) {
+            const char* mat = tri->Attribute("material");
+            const char* countAttr = tri->Attribute("count");
+            //printf("[dae-scan]  found <triangles> material='%s' count='%s'\n", mat ? mat : "(null)", countAttr ? countAttr : "(null)");
+
+            // parse input offsets to find VERTEX offset
+            std::unordered_map<std::string, int> inputOffsets;
+            int triMaxOffset = -1;
+            for (tinyxml2::XMLElement* in = tri->FirstChildElement("input"); in; in = in->NextSiblingElement("input")) {
+                const char* sem = in->Attribute("semantic");
+                int off = in->IntAttribute("offset", 0);
+                if (sem) inputOffsets[std::string(sem)] = off;
+                if (off > triMaxOffset) triMaxOffset = off;
+            }
+            int triInputCount = (triMaxOffset >= 0) ? (triMaxOffset + 1) : 1;
+            tinyxml2::XMLElement* pElem = tri->FirstChildElement("p");
+            if (!pElem || !pElem->GetText()) {
+                printf("[dae-scan]   <triangles> has no <p> content, skipping this block\n");
+                continue;
+            }
+            std::string ptext = pElem->GetText();
+            std::vector<unsigned int> pvals;
+            {
+                std::stringstream ssp(ptext);
+                unsigned int v;
+                while (ssp >> v) pvals.push_back(v);
+            }
+            size_t numbersPerTri = (size_t)triInputCount * 3u;
+            if (numbersPerTri == 0) {
+                printf("[dae-scan]   bad input count, skipping\n");
+                continue;
+            }
+            size_t triCount = 0;
+            unsigned int countAttrVal = tri->UnsignedAttribute("count", 0);
+            if (countAttrVal > 0) triCount = (size_t)countAttrVal;
+            else {
+                if (pvals.size() % numbersPerTri == 0) triCount = pvals.size() / numbersPerTri;
+                else triCount = pvals.size() / numbersPerTri; // fallback
+            }
+            //printf("[dae-scan]   tokens=%zu triCount=%zu inputCount=%d\n", pvals.size(), triCount, triInputCount);
+
+            int vertexOffset = 0;
+            std::unordered_map<std::string, int>::iterator itVert = inputOffsets.find("VERTEX");
+            if (itVert != inputOffsets.end()) vertexOffset = itVert->second;
+            else {
+                printf("[dae-scan]   no VERTEX input found, assuming offset 0\n");
+                vertexOffset = 0;
+            }
+
+            // collect triangles for this block only
+            std::vector<std::array<unsigned int, 3>> blockTriangles;
+            blockTriangles.reserve(triCount);
+            for (size_t t = 0; t < triCount; ++t) {
+                size_t triStart = t * numbersPerTri;
+                std::array<unsigned int, 3> triVerts;
+                for (int vtx = 0; vtx < 3; ++vtx) {
+                    size_t tokStart = triStart + (size_t)vtx * (size_t)triInputCount;
+                    size_t idxPos = tokStart + (size_t)vertexOffset;
+                    unsigned int vertIndex = 0;
+                    if (idxPos < pvals.size()) vertIndex = pvals[idxPos];
+                    else {
+                        printf("[dae-scan]    p token missing for geometry '%s' tri %zu vtx %d\n", geomId.c_str(), t, vtx);
+                        vertIndex = 0;
+                    }
+                    triVerts[vtx] = vertIndex;
+                }
+                blockTriangles.push_back(triVerts);
+            }
+
+            // build triangle -> boneSet mapping using boneWeightsPerGeometry for this block only
+            std::map<std::set<std::string>, std::vector<unsigned int>> boneSetToTriangleIndices;
+            auto bwGeomIt = boneWeightsPerGeometry.find(geomId);
+            for (unsigned int ti = 0; ti < blockTriangles.size(); ++ti) {
+                std::array<unsigned int, 3> triVerts = blockTriangles[ti];
+                std::set<std::string> boneSet;
+                if (bwGeomIt != boneWeightsPerGeometry.end()) {
+                    std::unordered_map<unsigned int, std::unordered_map<std::string, float>>& perVert = bwGeomIt->second;
+                    for (int k = 0; k < 3; ++k) {
+                        unsigned int vindex = triVerts[k];
+                        auto pvIt = perVert.find(vindex);
+                        if (pvIt != perVert.end()) {
+                            for (auto const& ppair : pvIt->second) {
+                                boneSet.insert(ppair.first);
+                            }
+                        }
+                    }
+                }
+                boneSetToTriangleIndices[boneSet].push_back(ti);
+            }
+
+            // convert map to list of group structs
+            struct BoneGroup {
+                std::set<std::string> bones;
+                std::vector<unsigned int> triangles;
+            };
+            std::vector<BoneGroup> groups;
+            for (auto& pair : boneSetToTriangleIndices) {
+                groups.push_back({ pair.first, pair.second });
+            }
+
+            // 1) subset merges: if group A bones ⊆ group B bones, merge A into B (if total <=6)
+            bool mergedAny = true;
+            while (mergedAny) {
+                mergedAny = false;
+                for (size_t i = 0; i < groups.size(); ++i) {
+                    for (size_t j = 0; j < groups.size(); ++j) {
+                        if (i == j) continue;
+                        // check if bones[i] is subset of bones[j]
+                        bool isSubset = std::includes(groups[j].bones.begin(), groups[j].bones.end(),
+                            groups[i].bones.begin(), groups[i].bones.end());
+                        if (isSubset) {
+                            if (groups[j].bones.size() <= 6) {
+                                groups[j].triangles.insert(groups[j].triangles.end(),
+                                    groups[i].triangles.begin(), groups[i].triangles.end());
+                                groups.erase(groups.begin() + i);
+                                mergedAny = true;
+                                break;
+                            }
+                        }
+                    }
+                    if (mergedAny) break;
+                }
+            }
+
+            // 2) then merge any two groups where combined bones <= 6 (normal brute force)
+            mergedAny = true;
+            while (mergedAny) {
+                mergedAny = false;
+                for (size_t i = 0; i < groups.size(); ++i) {
+                    for (size_t j = i + 1; j < groups.size(); ++j) {
+                        std::set<std::string> combined = groups[i].bones;
+                        combined.insert(groups[j].bones.begin(), groups[j].bones.end());
+                        if (combined.size() <= 6) {
+                            groups[i].bones = combined;
+                            groups[i].triangles.insert(groups[i].triangles.end(),
+                                groups[j].triangles.begin(), groups[j].triangles.end());
+                            groups.erase(groups.begin() + j);
+                            mergedAny = true;
+                            break;
+                        }
+                    }
+                    if (mergedAny) break;
+                }
+            }
+
+            // dump final groups for this block
+            //printf("== FINAL MERGED GROUPS (%llu total) for <triangles> block ==\n", groups.size());
+            //for (size_t i = 0; i < groups.size(); ++i) {
+            //    printf("  Group %llu: %llu triangles | bones used (%llu): ", i, groups[i].triangles.size(), groups[i].bones.size());
+            //    for (const auto& b : groups[i].bones) printf("%s ", b.c_str());
+            //    printf("\n");
+            //}
+
+            // append groups with global tri indices offset
+            for (size_t i = 0; i < groups.size(); ++i) {
+                FinalGroup fg;
+                fg.meshName = geomId;
+                for (auto tri : groups[i].triangles)
+                    fg.triangles.push_back((unsigned int)(triGlobalOffset + tri));
+                finalGroups.push_back(std::move(fg));
+            }
+
+            triGlobalOffset += blockTriangles.size();
+        }
+    }
+    printf("[dae-scan] finished. finalGroups.size=%zu\n", finalGroups.size());
+
+    // end of group building, below creates new triangles blocks
+    // map meshName -> vector of indices into finalGroups vector
+    std::unordered_map<std::string, std::vector<size_t>> meshNameToGroupIdx;
+    for (size_t i = 0; i < finalGroups.size(); ++i) {
+        meshNameToGroupIdx[finalGroups[i].meshName].push_back(i);
+    }
+
+    unsigned int geomCounter = 0;
+    for (XMLElement* geom = libGeoms->FirstChildElement("geometry"); geom; geom = geom->NextSiblingElement("geometry"), geomCounter++) {
+        XMLElement* meshElem = geom->FirstChildElement("mesh");
+        if (!meshElem) continue;
+
+        const char* geomId = geom->Attribute("id");
+        std::string geomName = geomId ? geomId : "";
+
+        //printf("[patch] geometry id='%s'\n", geomName.c_str());
+
+        auto mgIt = meshNameToGroupIdx.find(geomName);
+        if (mgIt == meshNameToGroupIdx.end()) {
+            printf("[patch] no final groups for geometry '%s'\n", geomName.c_str());
+            continue;
+        }
+
+        // collect all original <triangles> blocks in this mesh
+        struct OrigTriBlock {
+            XMLElement* elem;
+            std::string material;
+            std::vector<unsigned int> triIndices; // indices 0..n for this block triangles
+            int inputCount;
+            std::vector<unsigned int> pIndices; // raw indices from <p> for entire block
+        };
+        std::vector<OrigTriBlock> origTriBlocks;
+
+        for (XMLElement* tri = meshElem->FirstChildElement("triangles"); tri; tri = tri->NextSiblingElement("triangles")) {
+            OrigTriBlock block;
+            block.elem = tri;
+            block.material = tri->Attribute("material") ? tri->Attribute("material") : "";
+
+            int maxOffset = -1;
+            for (XMLElement* input = tri->FirstChildElement("input"); input; input = input->NextSiblingElement("input")) {
+                int off = input->IntAttribute("offset", 0);
+                if (off > maxOffset) maxOffset = off;
+            }
+            block.inputCount = maxOffset + 1;
+
+            XMLElement* pElem = tri->FirstChildElement("p");
+            if (!pElem || !pElem->GetText()) {
+                //printf("[patch] triangles block missing <p> content, skipping\n");
+                continue;
+            }
+            std::string ptext = pElem->GetText();
+            std::stringstream ssp(ptext);
+            unsigned int idx;
+            while (ssp >> idx) block.pIndices.push_back(idx);
+
+            unsigned int triCount = (unsigned int)(block.pIndices.size() / (block.inputCount * 3));
+            for (unsigned int i = 0; i < triCount; ++i) block.triIndices.push_back(i);
+
+            origTriBlocks.push_back(std::move(block));
+            //printf("[patch] found <triangles> block material='%s' triCount=%u\n", origTriBlocks.back().material.c_str(), triCount);
+        }
+
+        if (origTriBlocks.empty()) {
+            printf("[patch] no <triangles> blocks in mesh, skipping\n");
+            continue;
+        }
+
+        // for each group, find which original block contains its first triangle index
+        std::unordered_map<XMLElement*, std::vector<size_t>> blockToGroups; // block ptr -> finalGroups indices
+        std::vector<size_t> groupsForMesh = mgIt->second;
+
+        for (size_t gi : groupsForMesh) {
+            const FinalGroup& fg = finalGroups[gi];
+            if (fg.triangles.empty()) continue;
+            unsigned int firstTri = fg.triangles[0];
+
+            bool found = false;
+            for (auto& block : origTriBlocks) {
+                if (firstTri < block.triIndices.size()) {
+                    // check if firstTri fits inside this block (global tri index must be relative to block)
+                    // but finalGroups triangles indices are global per mesh, so we assume firstTri is local to mesh,
+                    // so we must confirm firstTri fits into this block’s range by offset.
+                    // we must find block’s global start triangle index on mesh (sum previous blocks' tri count)
+                    // let's do that:
+                    unsigned int blockStart = 0;
+                    for (auto& b2 : origTriBlocks) {
+                        if (b2.elem == block.elem) break;
+                        blockStart += (unsigned int)b2.triIndices.size();
+                    }
+                    if (firstTri >= blockStart && firstTri < blockStart + block.triIndices.size()) {
+                        blockToGroups[block.elem].push_back(gi);
+                        found = true;
+                        break;
+                    }
+                }
+            }
+            if (!found) {
+                printf("[patch] warning: could not find original <triangles> block for group first triangle %u\n", firstTri);
+            }
+        }
+
+        // now for each original triangles block with groups assigned, delete original block and add new <triangles> blocks per group
+        for (auto& pair : blockToGroups) {
+            XMLElement* origBlock = pair.first;
+            std::vector<size_t>& groupIndices = pair.second;
+
+            // find corresponding OrigTriBlock info
+            OrigTriBlock* blockInfo = nullptr;
+            for (auto& b : origTriBlocks) {
+                if (b.elem == origBlock) {
+                    blockInfo = &b;
+                    break;
+                }
+            }
+            if (!blockInfo) continue;
+
+            std::string materialName = blockInfo->material;
+            int inputCount = blockInfo->inputCount;
+
+            // clone input elements from original block once
+            std::vector<XMLElement*> inputClones;
+            for (XMLElement* input = origBlock->FirstChildElement("input"); input; input = input->NextSiblingElement("input")) {
+                inputClones.push_back(input->DeepClone(&doc)->ToElement());
+            }
+
+            XMLElement* parentMesh = origBlock->Parent()->ToElement();
+            if (!parentMesh) continue;
+
+            // delete original block
+            parentMesh->DeleteChild(origBlock);
+
+            for (size_t gi : groupIndices) {
+                const FinalGroup& fg = finalGroups[gi];
+
+                // build p text by gathering indices of each triangle from original pIndices
+                std::string ptext;
+                for (unsigned int triIdx : fg.triangles) {
+                    // calculate local triangle index in this block
+                    unsigned int blockStart = 0;
+                    for (auto& b2 : origTriBlocks) {
+                        if (b2.elem == origBlock) break;
+                        blockStart += (unsigned int)b2.triIndices.size();
+                    }
+                    unsigned int localTri = triIdx - blockStart;
+                    if (localTri >= blockInfo->triIndices.size()) {
+                        printf("[patch] warning: triangle index %u out of bounds for block with %zu tris\n", triIdx, blockInfo->triIndices.size());
+                        continue;
+                    }
+                    size_t baseIdx = localTri * inputCount * 3;
+                    if (baseIdx + (inputCount * 3) > blockInfo->pIndices.size()) {
+                        printf("[patch] warning: index out of pIndices range\n");
+                        continue;
+                    }
+                    for (int k = 0; k < inputCount * 3; ++k) {
+                        ptext += std::to_string(blockInfo->pIndices[baseIdx + k]) + " ";
+                    }
+                }
+                if (!ptext.empty()) ptext.pop_back();
+
+                XMLElement* newTri = doc.NewElement("triangles");
+                if (!materialName.empty()) newTri->SetAttribute("material", materialName.c_str());
+
+                int triCount = (int)(fg.triangles.size());
+                newTri->SetAttribute("count", triCount);
+
+                for (auto* inpClone : inputClones) {
+                    newTri->InsertEndChild(inpClone->DeepClone(&doc));
+                }
+
+                XMLElement* pElem = doc.NewElement("p");
+                pElem->SetText(ptext.c_str());
+                newTri->InsertEndChild(pElem);
+
+                parentMesh->InsertEndChild(newTri);
+            }
+        }
+    }
+    doc.SaveFile(daePath);
 }
