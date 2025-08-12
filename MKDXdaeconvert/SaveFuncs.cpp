@@ -650,6 +650,8 @@ void SaveDaeFile(const std::string& path, Header& headerData, std::vector<Materi
     }
 
     // create bones with weights on new mesh(es)
+    bool anyWeights = false;
+    std::vector<std::vector<uint32_t>> bonesToAddPerMesh(scene->mNumMeshes);
 
     for (size_t nodeIndex = 0; nodeIndex < fullNodeDataList.size(); nodeIndex++) {
         const auto& nodeData = fullNodeDataList[nodeIndex];
@@ -689,14 +691,6 @@ void SaveDaeFile(const std::string& path, Header& headerData, std::vector<Materi
                 vertexOffset += vertexCount;
             }
 
-            bool anyRealWeights = false;
-            for (const auto& bw : boneWeightsMap) {
-                if (!bw.second.empty()) {
-                    anyRealWeights = true;
-                    break;
-                }
-            }
-
             // collect all filtered bones first, keep order, even if they have 0 weights
             std::vector<uint32_t> orderedBones;
             std::unordered_set<uint32_t> written;
@@ -706,14 +700,16 @@ void SaveDaeFile(const std::string& path, Header& headerData, std::vector<Materi
                         orderedBones.push_back(boneIdx);
                 }
             }
-            // add all other nodes (excluding mesh holders) that weren't already added
+            if (!orderedBones.empty()) anyWeights = true;
+
+            // stash extra bones to add later if anyWeights true
             for (const auto& kv : nodeMap) {
                 uint32_t nodeIdx = kv.first;
                 if (kv.second->mNumMeshes > 0 || written.count(nodeIdx)) continue;
-                orderedBones.push_back(nodeIdx);
+                bonesToAddPerMesh[mergeSubmeshes ? parentNode->mMeshes[0] : meshBase + m].push_back(nodeIdx);
             }
 
-            // allocate bones
+            // allocate bones with weights only (no extras yet)
             mesh->mNumBones = static_cast<unsigned int>(orderedBones.size());
             mesh->mBones = new aiBone * [mesh->mNumBones];
             size_t boneIdx = 0;
@@ -746,6 +742,58 @@ void SaveDaeFile(const std::string& path, Header& headerData, std::vector<Materi
         }
         else {
             std::cout << "\nProcessed mesh " << allNodeNames[nodeIndex].Name;
+        }
+    }
+
+    // add all extra bones that have 0 weights if any weights exist in file
+    if (anyWeights) {
+        for (size_t meshIndex = 0; meshIndex < bonesToAddPerMesh.size(); meshIndex++) {
+            auto& meshBones = bonesToAddPerMesh[meshIndex];
+            if (meshBones.empty()) continue;
+
+            aiMesh* mesh = scene->mMeshes[meshIndex];
+
+            size_t oldNumBones = mesh->mNumBones;
+            size_t extraCount = meshBones.size();
+            size_t newNumBones = oldNumBones + extraCount;
+
+            aiBone** newBones = new aiBone * [newNumBones];
+
+            // copy existing bones first
+            for (size_t i = 0; i < oldNumBones; i++) {
+                newBones[i] = mesh->mBones[i];
+            }
+
+            // replace pointer after copying
+            delete[] mesh->mBones;
+            mesh->mBones = newBones;
+            mesh->mNumBones = static_cast<unsigned int>(newNumBones);
+
+            size_t boneIdx = oldNumBones;
+            aiNode* parentNode = nullptr;
+            for (const auto& kv : nodeMap) {
+                aiNode* n = kv.second;
+                if (n->mNumMeshes > 0) {
+                    for (unsigned int mi = 0; mi < n->mNumMeshes; mi++) {
+                        if (scene->mMeshes[n->mMeshes[mi]] == mesh) {
+                            parentNode = n;
+                            break;
+                        }
+                    }
+                    if (parentNode) break;
+                }
+            }
+
+            for (uint32_t nodeIdx : meshBones) {
+                aiBone* bone = new aiBone();
+                bone->mName = aiString(allNodeNames[nodeIdx].Name.c_str());
+                bone->mOffsetMatrix = GetOffsetMatrix(nodeMap[nodeIdx], parentNode);
+
+                bone->mNumWeights = 0;
+                bone->mWeights = nullptr;
+
+                mesh->mBones[boneIdx++] = bone;
+            }
         }
     }
 
