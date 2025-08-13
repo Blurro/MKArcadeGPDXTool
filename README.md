@@ -1,4 +1,5 @@
-# MKArcadeGPDXTool
+<img width="537" height="174" alt="image" src="https://github.com/user-attachments/assets/b9a5a086-9e9a-40d8-bca4-3f714425c5c5" />
+
 Tool that extracts/imports Mario Kart Arcade GP DX model files!
 
 I'm antsy waiting for the Switch 2 to be hacked so that I can dive right into making my first (or possibly THE first) MK World custom character, but since that isn't here yet I figured I'd get some practice in by looking at one of the few remaining unmodded Mario Karts!
