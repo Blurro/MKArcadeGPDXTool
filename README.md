@@ -17,14 +17,17 @@ I'm antsy waiting for the Switch 2 to be hacked so that I can dive right into ma
 ***Extracting***
 - Hit the Browse button or just drag and drop your .bin file onto the input box!
 - Move extracted dae and textures into the same folder for them to load in Maya/Blender
+- Choose the 'Merge' option to export with the game's split meshes merged to full meshes
 
 ***Importing***
 - Modify an existing .dae export in Maya or Blender and modify it, hit Browse or drag and drop your .dae into the top input box
-- (Meshes must be split by material and each have a max of 6 bones) now automatically handled by the tool so don't worry about this
 - All OG bones must exist but this may change once animations can be replaced
-- Meshes that are currently split will become submeshes of their main mesh upon import, see guide below on how to pair them to their main mesh
+- Have either everything inside Armature, or everything outside Armature + Armature deleted
 - Maya imports will turn '.' into 'FBXASC045', don't change this, the tool will still recognise this as a period upon reimport
 - Modify the (character)Preset.txt file to add/modify materials etc, then hit Browse or drag and drop it onto the bottom input box
+
+
+Below can be ignored, but this is how submesh merging works if you have a split model rather than an already full one
 
 **Submeshes in Maya:** All child meshes of a mesh will be treated as submeshes of that parent mesh - unless the mesh is listed in (character) Preset.txt file.
 Child submeshes can be named anything (these names will not be saved in the game file), just ensure all 'main' meshes are listed in your preset txt.
