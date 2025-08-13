@@ -15,6 +15,7 @@ I'm antsy waiting for the Switch 2 to be hacked so that I can dive right into ma
 
 ***Extracting***
 - Hit the Browse button or just drag and drop your .bin file onto the input box!
+- Move extracted dae and textures into the same folder for them to load in Maya/Blender
 
 ***Importing***
 - Modify an existing .dae export in Maya or Blender and modify it, hit Browse or drag and drop your .dae into the top input box
