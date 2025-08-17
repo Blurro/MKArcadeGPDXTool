@@ -369,7 +369,7 @@ void SaveDaeFile(const std::string& path, const std::string& outDir, Header& hea
         }
         if (materialsData[i].TextureIndices[3] >= 0 && materialsData[i].TextureIndices[3] < (int)textureNames.size()) {
             aiString texPath(textureNames[materialsData[i].TextureIndices[3]].Name.c_str());
-            scene->mMaterials[i]->AddProperty(&texPath, AI_MATKEY_TEXTURE_EMISSIVE(0)); // unsure but dont think it matters
+            //scene->mMaterials[i]->AddProperty(&texPath, AI_MATKEY_TEXTURE_EMISSIVE(0)); // unsure but wont work in viewers like maya/blender by default anyway
         }
         if (materialsData[i].TextureIndices[4] >= 0 && materialsData[i].TextureIndices[4] < (int)textureNames.size()) {
             aiString texPath(textureNames[materialsData[i].TextureIndices[4]].Name.c_str());
@@ -396,12 +396,27 @@ void SaveDaeFile(const std::string& path, const std::string& outDir, Header& hea
         aiVector3D scaleVec(nodeData.boneData.Scale[0], nodeData.boneData.Scale[1], nodeData.boneData.Scale[2]);
         aiMatrix4x4::Scaling(scaleVec, scaleMat);
 
-        // create rotation matrix from euler angles (in radians)
+        // all rotation stuff
+        // rotation matrices
         aiMatrix4x4 rotX, rotY, rotZ;
         aiMatrix4x4::RotationX(nodeData.boneData.Rotation[0], rotX);
         aiMatrix4x4::RotationY(nodeData.boneData.Rotation[1], rotY);
         aiMatrix4x4::RotationZ(nodeData.boneData.Rotation[2], rotZ);
+
+        // compose in Z * Y * X order
         aiMatrix4x4 rotMat = rotZ * rotY * rotX;
+
+        // optionally re-orthogonalize rotation axes
+        aiVector3t<float> col0(rotMat.a1, rotMat.b1, rotMat.c1);
+        aiVector3t<float> col1(rotMat.a2, rotMat.b2, rotMat.c2);
+        aiVector3t<float> col2 = col0 ^ col1; // cross product
+        col1 = col2 ^ col0;                   // second axis corrected
+        col0.Normalize();
+        col1.Normalize();
+        col2.Normalize();
+        rotMat.a1 = col0.x; rotMat.b1 = col0.y; rotMat.c1 = col0.z;
+        rotMat.a2 = col1.x; rotMat.b2 = col1.y; rotMat.c2 = col1.z;
+        rotMat.a3 = col2.x; rotMat.b3 = col2.y; rotMat.c3 = col2.z;
 
         // create translation matrix
         aiMatrix4x4 transMat;
@@ -470,8 +485,6 @@ void SaveDaeFile(const std::string& path, const std::string& outDir, Header& hea
                     }
                 }
 
-                std::vector<uint16_t> rawIndices = (nodeData.polygonsList.size() > s) ? nodeData.polygonsList[s] : std::vector<uint16_t>{};
-
                 // add verts, norms, uvs
                 mergedVerts.insert(mergedVerts.end(), verts.begin(), verts.end());
 
@@ -487,13 +500,13 @@ void SaveDaeFile(const std::string& path, const std::string& outDir, Header& hea
                     mergedUVs[uvIdx].insert(mergedUVs[uvIdx].end(), uvs[uvIdx].begin(), uvs[uvIdx].end());
 
                 // adjust indices and add faces
-                for (size_t i = 0; i + 2 < rawIndices.size(); i += 3) {
+                for (size_t i = 0; i + 2 < nodeData.polygonsList[s].size(); i += 3) {
                     aiFace face;
                     face.mNumIndices = 3;
                     face.mIndices = new unsigned int[3] {
-                        static_cast<unsigned int>(rawIndices[i]) + vertexOffset,
-                            static_cast<unsigned int>(rawIndices[i + 1]) + vertexOffset,
-                            static_cast<unsigned int>(rawIndices[i + 2]) + vertexOffset
+                        static_cast<unsigned int>(nodeData.polygonsList[s][i]) + vertexOffset,
+                            static_cast<unsigned int>(nodeData.polygonsList[s][i + 1]) + vertexOffset,
+                            static_cast<unsigned int>(nodeData.polygonsList[s][i + 2]) + vertexOffset
                         };
                     mergedFaces.push_back(face);
 
@@ -608,8 +621,6 @@ void SaveDaeFile(const std::string& path, const std::string& outDir, Header& hea
                     }
                 }
 
-                std::vector<uint16_t> rawIndices = (nodeData.polygonsList.size() > s) ? nodeData.polygonsList[s] : std::vector<uint16_t>{};
-
                 auto* mesh = new aiMesh();
                 mesh->mName = aiString(std::string(parentNode->mName.C_Str())); // still give it the node name
 
@@ -635,15 +646,15 @@ void SaveDaeFile(const std::string& path, const std::string& outDir, Header& hea
                     }
                 }
 
-                mesh->mNumFaces = static_cast<unsigned int>(rawIndices.size() / 3);
+                mesh->mNumFaces = static_cast<unsigned int>(nodeData.polygonsList[s].size() / 3);
                 mesh->mFaces = new aiFace[mesh->mNumFaces];
-                for (size_t i = 0; i + 2 < rawIndices.size(); i += 3) {
+                for (size_t i = 0; i + 2 < nodeData.polygonsList[s].size(); i += 3) {
                     aiFace& face = mesh->mFaces[i / 3];
                     face.mNumIndices = 3;
                     face.mIndices = new unsigned int[3] {
-                        static_cast<unsigned int>(rawIndices[i]),
-                            static_cast<unsigned int>(rawIndices[i + 1]),
-                            static_cast<unsigned int>(rawIndices[i + 2])
+                        static_cast<unsigned int>(nodeData.polygonsList[s][i]),
+                            static_cast<unsigned int>(nodeData.polygonsList[s][i + 1]),
+                            static_cast<unsigned int>(nodeData.polygonsList[s][i + 2])
                         };
                 }
 
@@ -673,6 +684,7 @@ void SaveDaeFile(const std::string& path, const std::string& outDir, Header& hea
     // create bones with weights on new mesh(es)
     bool anyWeights = false;
     std::vector<std::vector<uint32_t>> bonesToAddPerMesh(scene->mNumMeshes);
+    std::unordered_set<uint32_t> usedBones;
 
     for (size_t nodeIndex = 0; nodeIndex < fullNodeDataList.size(); nodeIndex++) {
         const auto& nodeData = fullNodeDataList[nodeIndex];
@@ -698,6 +710,10 @@ void SaveDaeFile(const std::string& path, const std::string& outDir, Header& hea
                 for (uint32_t i = 0; i < linkIt->BoneOffsets.size(); ++i)
                     if (mask & (1 << i)) filtered.push_back(linkIt->BoneOffsets[i]);
 
+                if (!filtered.empty()) {
+                    for (uint32_t idx : filtered) usedBones.insert(idx); // <-- mark as used globally
+                }
+
                 size_t vertexCount = sub.VertexCount;
                 const auto& weightsFlat = nodeData.weightsList[s];
                 for (size_t b = 0; b < filtered.size(); b++) {
@@ -712,7 +728,7 @@ void SaveDaeFile(const std::string& path, const std::string& outDir, Header& hea
                 vertexOffset += vertexCount;
             }
 
-            // collect all filtered bones first, keep order, even if they have 0 weights
+            // same as before: allocate bones with weights
             std::vector<uint32_t> orderedBones;
             std::unordered_set<uint32_t> written;
             if (linkIt != nodeLinks.end()) {
@@ -723,18 +739,9 @@ void SaveDaeFile(const std::string& path, const std::string& outDir, Header& hea
             }
             if (!orderedBones.empty()) anyWeights = true;
 
-            // stash extra bones to add later if anyWeights true
-            for (const auto& kv : nodeMap) {
-                uint32_t nodeIdx = kv.first;
-                if (kv.second->mNumMeshes > 0 || written.count(nodeIdx)) continue;
-                bonesToAddPerMesh[mergeSubmeshes ? parentNode->mMeshes[0] : meshBase + m].push_back(nodeIdx);
-            }
-
-            // allocate bones with weights only (no extras yet)
             mesh->mNumBones = static_cast<unsigned int>(orderedBones.size());
             mesh->mBones = new aiBone * [mesh->mNumBones];
             size_t boneIdx = 0;
-
             for (uint32_t nodeIdx : orderedBones) {
                 aiBone* bone = new aiBone();
                 bone->mName = aiString(allNodeNames[nodeIdx].Name.c_str());
@@ -750,69 +757,86 @@ void SaveDaeFile(const std::string& path, const std::string& outDir, Header& hea
                     bone->mNumWeights = 0;
                     bone->mWeights = nullptr;
                 }
-
                 mesh->mBones[boneIdx++] = bone;
             }
         }
-
-        if (mergeSubmeshes && subCount > 1) {
-            std::cout << "\nProcessed merged mesh " << allNodeNames[nodeIndex].Name;
-        }
-        else if (subCount > 1) {
-            std::cout << "\nProcessed submeshes of mesh " << allNodeNames[nodeIndex].Name;
-        }
-        else {
-            std::cout << "\nProcessed mesh " << allNodeNames[nodeIndex].Name;
-        }
     }
 
-    // add all extra bones that have 0 weights if any weights exist in file
-    if (anyWeights) {
-        for (size_t meshIndex = 0; meshIndex < bonesToAddPerMesh.size(); meshIndex++) {
-            auto& meshBones = bonesToAddPerMesh[meshIndex];
-            if (meshBones.empty()) continue;
-
+    // final pass: add all bones that were **used anywhere** to meshes that didn't have them yet
+    if (anyWeights && !usedBones.empty()) {
+        for (size_t meshIndex = 0; meshIndex < scene->mNumMeshes; meshIndex++) {
             aiMesh* mesh = scene->mMeshes[meshIndex];
 
-            size_t oldNumBones = mesh->mNumBones;
-            size_t extraCount = meshBones.size();
-            size_t newNumBones = oldNumBones + extraCount;
+            // skip meshes with no bones/weights at all
+            bool hasWeights = false;
+            for (size_t b = 0; b < mesh->mNumBones; b++) {
+                if (mesh->mBones[b] && mesh->mBones[b]->mNumWeights > 0) {
+                    hasWeights = true;
+                    break;
+                }
+            }
+            if (!hasWeights) continue; // leave meshes with no skinning untouched
 
-            aiBone** newBones = new aiBone * [newNumBones];
-
-            // copy existing bones first
-            for (size_t i = 0; i < oldNumBones; i++) {
-                newBones[i] = mesh->mBones[i];
+            // collect all bones currently in mesh
+            std::unordered_set<uint32_t> meshBones;
+            for (size_t b = 0; b < mesh->mNumBones; b++) {
+                for (size_t idx = 0; idx < allNodeNames.size(); idx++) {
+                    if (std::string(mesh->mBones[b]->mName.C_Str()) == allNodeNames[idx].Name) {
+                        meshBones.insert(idx);
+                        break;
+                    }
+                }
             }
 
-            // replace pointer after copying
+            // collect bones to add: usedBones + all parents up to armature
+            std::vector<uint32_t> bonesToAdd;
+            for (uint32_t idx : usedBones) {
+                aiNode* n = nodeMap[idx];
+                while (n && n != armatureNode) {
+                    auto it = std::find_if(allNodeNames.begin(), allNodeNames.end(),
+                        [&](const auto& x) { return x.Name == n->mName.C_Str(); });
+                    if (it != allNodeNames.end()) {
+                        uint32_t nodeIdx = static_cast<uint32_t>(std::distance(allNodeNames.begin(), it));
+                        if (!meshBones.count(nodeIdx)) {
+                            bonesToAdd.push_back(nodeIdx);
+                            meshBones.insert(nodeIdx);
+                        }
+                    }
+                    n = n->mParent;
+                }
+            }
+
+            if (bonesToAdd.empty()) continue;
+
+            // allocate new bones array
+            size_t oldNumBones = mesh->mNumBones;
+            size_t newNumBones = oldNumBones + bonesToAdd.size();
+            aiBone** newBones = new aiBone * [newNumBones];
+            for (size_t i = 0; i < oldNumBones; i++) newBones[i] = mesh->mBones[i];
             delete[] mesh->mBones;
             mesh->mBones = newBones;
             mesh->mNumBones = static_cast<unsigned int>(newNumBones);
 
-            size_t boneIdx = oldNumBones;
+            // find parent node for offset matrices
             aiNode* parentNode = nullptr;
             for (const auto& kv : nodeMap) {
                 aiNode* n = kv.second;
                 if (n->mNumMeshes > 0) {
                     for (unsigned int mi = 0; mi < n->mNumMeshes; mi++) {
-                        if (scene->mMeshes[n->mMeshes[mi]] == mesh) {
-                            parentNode = n;
-                            break;
-                        }
+                        if (scene->mMeshes[n->mMeshes[mi]] == mesh) { parentNode = n; break; }
                     }
                     if (parentNode) break;
                 }
             }
 
-            for (uint32_t nodeIdx : meshBones) {
+            // add new bones
+            size_t boneIdx = oldNumBones;
+            for (uint32_t idx : bonesToAdd) {
                 aiBone* bone = new aiBone();
-                bone->mName = aiString(allNodeNames[nodeIdx].Name.c_str());
-                bone->mOffsetMatrix = GetOffsetMatrix(nodeMap[nodeIdx], parentNode);
-
+                bone->mName = aiString(allNodeNames[idx].Name.c_str());
+                bone->mOffsetMatrix = GetOffsetMatrix(nodeMap[idx], parentNode);
                 bone->mNumWeights = 0;
                 bone->mWeights = nullptr;
-
                 mesh->mBones[boneIdx++] = bone;
             }
         }
@@ -841,7 +865,19 @@ void SaveDaeFile(const std::string& path, const std::string& outDir, Header& hea
     CallPatchDaeFileDLL(outFile, allMaterialToIndices);
     CallGetNormalsFromDLL(outFile);
     std::cout << std::endl << "Saved file as " << outFile << std::endl;
-	std::ofstream(logPath.c_str(), std::ios::trunc) << "Saved collada file to " << outFile << "\n\nAlong with Maya py script to import normals\n(Blender can skip this)\n\nCreated " << presetFilename + "Preset.txt" << " file for MKDX importing" << std::endl;
+
+    // convert to fbx thanks autodesk for coming in clutch
+    struct stat buf;
+    std::string exePath = exeDir + "\\fbxtool\\FbxConverter.exe";
+    std::string fbxPath = outFile.substr(0, outFile.find_last_of('.')) + ".fbx";
+    if (stat(exePath.c_str(), &buf) == 0) {
+        std::string cmd = "\"" + exePath + "\" \"" + outFile + "\" \"" + fbxPath + "\"";
+        cmd = "\"" + cmd + "\"";
+        //std::cout << "running command: " << cmd << std::endl;
+        system(cmd.c_str());
+    }
+
+	std::ofstream(logPath.c_str(), std::ios::trunc) << "Saved collada file to " << outFile << "\nAlong with Maya py script to import normals\n\nBlender users must open created FBX imported at scale 100\n\nCreated " << presetFilename + "Preset.txt" << " file for MKDX importing" << std::endl;
 }
 
 void SaveMKDXFile(const std::string& path, const std::string& outDir, Header& header, std::vector<Material>& materialsData,

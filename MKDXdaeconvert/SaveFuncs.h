@@ -16,3 +16,4 @@ void SaveDaeFile(const std::string& path, const std::string& outDir, Header& hea
 MKDXData LoadMKDXFile(std::ifstream& fs);
 
 extern std::string logPath;
+extern std::string exeDir;

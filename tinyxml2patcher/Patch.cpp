@@ -43,6 +43,156 @@ tinyxml2::XMLElement* FindInstance(tinyxml2::XMLElement* node, const std::string
     return nullptr;
 }
 
+bool IsMeshNode(tinyxml2::XMLElement* node)
+{
+    for (tinyxml2::XMLElement* child = node->FirstChildElement(); child; child = child->NextSiblingElement())
+    {
+        const char* name = child->Name();
+        if (strcmp(name, "instance_geometry") == 0 || strcmp(name, "instance_controller") == 0)
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+void FindMeshNodes(tinyxml2::XMLElement* node,
+    tinyxml2::XMLElement* parent,
+    std::vector<std::pair<tinyxml2::XMLElement*, tinyxml2::XMLElement*> >& out)
+{
+    if (IsMeshNode(node))
+    {
+        tinyxml2::XMLElement* meshParent = 0;
+        if (parent && IsMeshNode(parent))
+        {
+            meshParent = parent;
+        }
+
+        out.push_back(std::make_pair(node, meshParent));
+
+        printf("[mesh found] node=%s parent=%s\n",
+            node->Attribute("name") ? node->Attribute("name") : "(unnamed)",
+            meshParent && meshParent->Attribute("name") ? meshParent->Attribute("name") : "(null)");
+    }
+
+    for (tinyxml2::XMLElement* child = node->FirstChildElement("node"); child; child = child->NextSiblingElement("node"))
+    {
+        FindMeshNodes(child, node, out);
+    }
+}
+
+void RecursiveStripUnderNode(tinyxml2::XMLElement* node)
+{
+    // strip this node if it contains mesh instances
+    tinyxml2::XMLElement* child = node->FirstChildElement();
+    while (child)
+    {
+        const char* name = child->Name();
+        tinyxml2::XMLElement* nextChild = child->NextSiblingElement();
+
+        if (strcmp(name, "instance_geometry") == 0 || strcmp(name, "instance_controller") == 0)
+        {
+            printf("[strip] removing %s from node %s\n",
+                name,
+                node->Attribute("name") ? node->Attribute("name") : "(unnamed)");
+            node->DeleteChild(child);
+        }
+
+        child = nextChild;
+    }
+
+    // go deeper into child <node> elements
+    tinyxml2::XMLElement* childNode = node->FirstChildElement("node");
+    while (childNode)
+    {
+        RecursiveStripUnderNode(childNode);
+        childNode = childNode->NextSiblingElement("node");
+    }
+}
+
+void RecursiveDeleteNonMeshNodes(tinyxml2::XMLElement* node)
+{
+    tinyxml2::XMLElement* child = node->FirstChildElement("node");
+    while (child)
+    {
+        tinyxml2::XMLElement* nextChild = child->NextSiblingElement("node");
+
+        if (!IsMeshNode(child))
+        {
+            printf("[delete non-mesh] %s under mesh node %s\n",
+                child->Attribute("name") ? child->Attribute("name") : "(unnamed)",
+                node->Attribute("name") ? node->Attribute("name") : "(unnamed)");
+            node->DeleteChild(child);
+        }
+        else
+        {
+            // recurse into mesh children
+            RecursiveDeleteNonMeshNodes(child);
+        }
+
+        child = nextChild;
+    }
+}
+
+struct Mat4
+{
+    float m[4][4];
+
+    Mat4() { std::memset(m, 0, sizeof(m)); m[0][0] = m[1][1] = m[2][2] = m[3][3] = 1.f; } // identity
+
+    Mat4 operator*(const Mat4& o) const
+    {
+        Mat4 r;
+        for (int i = 0;i < 4;i++)
+            for (int j = 0;j < 4;j++)
+            {
+                r.m[i][j] = 0.f;
+                for (int k = 0;k < 4;k++)
+                    r.m[i][j] += m[i][k] * o.m[k][j];
+            }
+        return r;
+    }
+};
+
+Mat4 ParseMatrix(tinyxml2::XMLElement* node)
+{
+    Mat4 mat;
+    tinyxml2::XMLElement* matElem = node->FirstChildElement("matrix");
+    if (matElem && matElem->GetText())
+    {
+        std::istringstream iss(matElem->GetText());
+        for (int i = 0;i < 4;i++)
+            for (int j = 0;j < 4;j++)
+                iss >> mat.m[i][j];
+    }
+    return mat;
+}
+
+Mat4 GetWorldMatrix(tinyxml2::XMLElement* node)
+{
+    Mat4 local = ParseMatrix(node);
+
+    tinyxml2::XMLElement* parent = node->Parent()->ToElement();
+    if (parent && strcmp(parent->Name(), "node") == 0)
+    {
+        Mat4 parentWorld = GetWorldMatrix(parent);
+        return parentWorld * local;
+    }
+    return local;
+}
+
+std::string MatrixToString(const Mat4& mat)
+{
+    std::ostringstream oss;
+    oss.precision(9);
+    oss << std::fixed
+        << mat.m[0][0] << " " << mat.m[0][1] << " " << mat.m[0][2] << " " << mat.m[0][3] << " "
+        << mat.m[1][0] << " " << mat.m[1][1] << " " << mat.m[1][2] << " " << mat.m[1][3] << " "
+        << mat.m[2][0] << " " << mat.m[2][1] << " " << mat.m[2][2] << " " << mat.m[2][3] << " "
+        << mat.m[3][0] << " " << mat.m[3][1] << " " << mat.m[3][2] << " " << mat.m[3][3];
+    return oss.str();
+}
+
 extern "C" __declspec(dllexport) void __cdecl PatchDaeFile_C(const char* filePath, const char* matInfoPath)
 {
     XMLDocument doc;
@@ -281,35 +431,50 @@ extern "C" __declspec(dllexport) void __cdecl PatchDaeFile_C(const char* filePat
         }
     }
 
-	// cool block to merge vertices with the same position
+	// cool block to merge vertices with the same position, also doubles p block for texcoord to have offset 1
     for (auto geometry = libGeometries->FirstChildElement("geometry"); geometry; geometry = geometry->NextSiblingElement("geometry")) {
         auto mesh = geometry->FirstChildElement("mesh");
         if (!mesh) continue;
 
         for (auto tri = mesh->FirstChildElement("triangles"); tri; tri = tri->NextSiblingElement("triangles")) {
-            for (auto input = tri->FirstChildElement("input"); input; input = input->NextSiblingElement("input")) {
-                const char* semantic = input->Attribute("semantic");
-                if (!semantic) continue;
-                if (std::string(semantic) == "TEXCOORD") input->SetAttribute("offset", 1);
-                else input->SetAttribute("offset", 0);
-            }
-
             auto p = tri->FirstChildElement("p");
             if (!p || !p->GetText()) continue;
 
-            std::stringstream ss(p->GetText());
-            std::vector<unsigned int> doubled;
-            unsigned int val;
-            while (ss >> val) {
-                doubled.push_back(val);
-                doubled.push_back(val);
+            // detect if TEXCOORD or COLOR exists
+            bool hasTexcoord = false;
+            bool hasColor = false;
+            for (auto input = tri->FirstChildElement("input"); input; input = input->NextSiblingElement("input")) {
+                const char* semantic = input->Attribute("semantic");
+                if (!semantic) continue;
+                std::string semStr = semantic;
+                if (semStr == "TEXCOORD") {
+                    hasTexcoord = true;
+                    input->SetAttribute("offset", 1);
+                }
+                else if (semStr == "COLOR") {
+                    hasColor = true;
+                    input->SetAttribute("offset", 1);
+                }
+                else {
+                    input->SetAttribute("offset", 0);
+                }
             }
 
-            std::stringstream doubledSS;
-            for (auto v : doubled) doubledSS << v << " ";
-            std::string doubledStr = doubledSS.str();
-            if (!doubledStr.empty()) doubledStr.pop_back();
-            p->SetText(doubledStr.c_str());
+            // only double <p> if TEXCOORD or COLOR exists
+            if (hasTexcoord || hasColor) {
+                std::stringstream ss(p->GetText());
+                std::vector<unsigned int> doubled;
+                unsigned int val;
+                while (ss >> val) {
+                    doubled.push_back(val);
+                    doubled.push_back(val);
+                }
+                std::stringstream doubledSS;
+                for (auto v : doubled) doubledSS << v << " ";
+                std::string doubledStr = doubledSS.str();
+                if (!doubledStr.empty()) doubledStr.pop_back();
+                p->SetText(doubledStr.c_str());
+            }
 
             auto vertices = mesh->FirstChildElement("vertices");
             if (!vertices) continue;
@@ -437,6 +602,88 @@ extern "C" __declspec(dllexport) void __cdecl PatchDaeFile_C(const char* filePat
             std::string outStr = outSS.str();
             if (!outStr.empty()) outStr.pop_back();
             p->SetText(outStr.c_str());
+        }
+    }
+
+    bool aaa = false;
+    if (aaa) {
+        // create a duplicate for every mesh node (that isnt under armature) to be placed under armature (with baked matrix), strip out instance geometry from original mesh nodes
+        tinyxml2::XMLElement* root = doc.FirstChildElement("COLLADA")->FirstChildElement("library_visual_scenes")->FirstChildElement("visual_scene");
+        tinyxml2::XMLElement* armatureNode = root->FirstChildElement("node");
+
+        std::vector<tinyxml2::XMLElement*> nonMeshUnderArmature;
+        tinyxml2::XMLElement* child = armatureNode->FirstChildElement("node");
+        while (child)
+        {
+            if (!IsMeshNode(child))
+            {
+                nonMeshUnderArmature.push_back(child);
+                printf("[non-mesh direct child under armature] %s\n",
+                    child->Attribute("name") ? child->Attribute("name") : "(unnamed)");
+            }
+            child = child->NextSiblingElement("node");
+        }
+
+        std::vector<std::pair<tinyxml2::XMLElement*, tinyxml2::XMLElement*> > foundMeshes;
+        for (size_t i = 0; i < nonMeshUnderArmature.size(); ++i)
+        {
+            FindMeshNodes(nonMeshUnderArmature[i], 0, foundMeshes);
+        }
+
+        for (size_t i = 0; i < foundMeshes.size(); ++i)
+        {
+            tinyxml2::XMLElement* meshNode = foundMeshes[i].first;
+            tinyxml2::XMLElement* meshParent = foundMeshes[i].second;
+
+            // skip duplication if this mesh has a mesh-node parent
+            if (meshParent)
+            {
+                printf("[skipped duplicate] %s (had mesh parent %s)\n",
+                    meshNode->Attribute("name") ? meshNode->Attribute("name") : "(unnamed)",
+                    meshParent->Attribute("name") ? meshParent->Attribute("name") : "(unnamed)");
+                continue;
+            }
+
+            tinyxml2::XMLElement* duplicate = meshNode->DeepClone(&doc)->ToElement();
+
+            // bake world transform
+            Mat4 worldMat = GetWorldMatrix(meshNode);
+            tinyxml2::XMLElement* matElem = duplicate->FirstChildElement("matrix");
+            if (!matElem) {
+                matElem = doc.NewElement("matrix");
+                duplicate->InsertFirstChild(matElem);
+            }
+            matElem->SetText(MatrixToString(worldMat).c_str());
+
+            // insert under armature
+            armatureNode->InsertEndChild(duplicate);
+
+
+            printf("[duplicated mesh] %s placed under armature\n",
+                duplicate->Attribute("name") ? duplicate->Attribute("name") : "(unnamed)");
+        }
+
+        for (size_t i = 0; i < nonMeshUnderArmature.size(); ++i)
+        {
+            RecursiveStripUnderNode(nonMeshUnderArmature[i]);
+        }
+
+        std::vector<tinyxml2::XMLElement*> meshUnderArmature;
+        tinyxml2::XMLElement* mChild = armatureNode->FirstChildElement("node");
+        while (mChild)
+        {
+            if (IsMeshNode(mChild))
+            {
+                meshUnderArmature.push_back(mChild);
+                printf("[mesh direct child under armature for delete pass] %s\n",
+                    mChild->Attribute("name") ? mChild->Attribute("name") : "(unnamed)");
+            }
+            mChild = mChild->NextSiblingElement("node");
+        }
+
+        for (size_t i = 0; i < meshUnderArmature.size(); ++i)
+        {
+            RecursiveDeleteNonMeshNodes(meshUnderArmature[i]);
         }
     }
 
@@ -1768,5 +2015,59 @@ extern "C" __declspec(dllexport) void __cdecl PatchDaePreImport_C(const char* da
             }
         }
     }
+    doc.SaveFile(daePath);
+}
+
+extern "C" __declspec(dllexport) void __cdecl PatchDaePreAll_C(const char* daePath)
+{
+    tinyxml2::XMLDocument doc;
+    doc.LoadFile(daePath);
+
+    tinyxml2::XMLElement* collada = doc.FirstChildElement("COLLADA");
+    if (!collada) return;
+
+    tinyxml2::XMLElement* libVisualScenes = collada->FirstChildElement("library_visual_scenes");
+    if (!libVisualScenes) return;
+
+    tinyxml2::XMLElement* visualScene = libVisualScenes->FirstChildElement("visual_scene");
+    if (!visualScene) return;
+
+    auto toLower = [](const char* s) {
+        std::string r;
+        while (*s) r += (char)std::tolower(*s++);
+        return r;
+        };
+
+    tinyxml2::XMLElement* armature = nullptr;
+    for (tinyxml2::XMLElement* node = visualScene->FirstChildElement("node"); node; node = node->NextSiblingElement("node")) {
+        const char* id = node->Attribute("id");
+        const char* name = node->Attribute("name");
+        if ((id && toLower(id) == "armature") || (name && toLower(name) == "armature")) {
+            armature = node;
+            break;
+        }
+    }
+
+    if (!armature) {
+        return; // nothing to do if no armature node
+    }
+
+    // move all siblings of armature into armature
+    std::vector<tinyxml2::XMLElement*> toMove;
+    for (tinyxml2::XMLElement* node = visualScene->FirstChildElement("node"); node; node = node->NextSiblingElement("node")) {
+        if (node != armature) {
+            toMove.push_back(node);
+        }
+    }
+
+    for (tinyxml2::XMLElement* node = visualScene->FirstChildElement("node"); node; ) {
+        tinyxml2::XMLElement* next = node->NextSiblingElement("node");
+        if (node != armature) {
+            armature->InsertEndChild(node->DeepClone(&doc)); // clone into armature
+            visualScene->DeleteChild(node);                 // delete original
+        }
+        node = next;
+    }
+
     doc.SaveFile(daePath);
 }

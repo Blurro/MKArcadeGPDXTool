@@ -122,27 +122,50 @@ std::string ReadCStringAtOffset(std::istream& stream, uint32_t pointer) {
     return result;
 }
 
-std::vector<float> QuaternionToEulerXYZ(const aiQuaterniont<float>& q) {
-    float x = q.x;
-    float y = q.y;
-    float z = q.z;
-    float w = q.w;
+aiVector3D MatrixToEulerXYZ(const aiMatrix4x4& m)
+{
+    // Extract pure rotation part (strip translation and scale)
+    aiVector3D xAxis(m.a1, m.b1, m.c1);
+    aiVector3D yAxis(m.a2, m.b2, m.c2);
+    aiVector3D zAxis(m.a3, m.b3, m.c3);
 
-    float sinr_cosp = 2.f * (w * x + y * z);
-    float cosr_cosp = 1.f - 2.f * (x * x + y * y);
-    float roll = std::atan2(sinr_cosp, cosr_cosp);
+    // Normalize axes to remove scale
+    xAxis.Normalize();
+    yAxis.Normalize();
+    zAxis.Normalize();
 
-    float sinp = 2.f * (w * y - z * x);
-    float pitch = std::abs(sinp) >= 1.f ? std::copysign(AI_MATH_PI / 2.f, sinp) : std::asin(sinp);
+    // Build normalized rotation matrix
+    double r00 = xAxis.x, r01 = yAxis.x, r02 = zAxis.x;
+    double r10 = xAxis.y, r11 = yAxis.y, r12 = zAxis.y;
+    double r20 = xAxis.z, r21 = yAxis.z, r22 = zAxis.z;
 
-    float siny_cosp = 2.f * (w * z + x * y);
-    float cosy_cosp = 1.f - 2.f * (y * y + z * z);
-    float yaw = std::atan2(siny_cosp, cosy_cosp);
+    aiVector3D euler;
 
-    return { roll, pitch, yaw }; // in radians
+    // XYZ rotation order (same as Maya/Blender default)
+    if (r02 < 1.0) {
+        if (r02 > -1.0) {
+            euler.y = std::asin(r02);                 // Y
+            euler.x = std::atan2(-r12, r22);          // X
+            euler.z = std::atan2(-r01, r00);          // Z
+        }
+        else {
+            // r02 == -1 -> -90° gimbal lock
+            euler.y = -AI_MATH_PI / 2.0;
+            euler.x = -std::atan2(r10, r11);
+            euler.z = 0.0;
+        }
+    }
+    else {
+        // r02 == +1 -> +90° gimbal lock
+        euler.y = AI_MATH_PI / 2.0;
+        euler.x = std::atan2(r10, r11);
+        euler.z = 0.0;
+    }
+
+    return euler; // in radians, XYZ order
 }
 
-std::string CloneAndFixFBXASC(const std::string& originalPath) {
+std::string CloneAndFixFBXASC(const std::string& originalPath, bool fbx) {
     std::ifstream in(originalPath);
     if (!in) {
         std::cerr << "failed to open dae for fix: " << originalPath << "\n";
@@ -161,7 +184,11 @@ std::string CloneAndFixFBXASC(const std::string& originalPath) {
     while ((pos = content.find(needle, pos)) != std::string::npos)
         content.replace(pos, needle.length(), dot);
 
-    std::string tempPath = originalPath + "tmp";
+    std::string tempPath = originalPath;
+    if (!fbx) {
+        tempPath += "tmp";
+    }
+
     std::ofstream out(tempPath);
     if (!out) {
         std::cerr << "failed to write tmp dae\n";
@@ -274,7 +301,6 @@ std::unordered_map<std::string, int> CallGetMaterialIndicesFromDLL(const std::st
 }
 
 typedef void(__cdecl* PatchDaePreImportFunc)(const char*, const char*);
-
 void CallPatchDaePreImportFromDLL(const std::string& path, const std::string& groupsFile)
 {
     HMODULE dll = LoadLibraryA("tinyxml2patcher.dll");
@@ -289,6 +315,26 @@ void CallPatchDaePreImportFromDLL(const std::string& path, const std::string& gr
         return;
     }
     patchFunc(path.c_str(), groupsFile.c_str());
+    FreeLibrary(dll);
+}
+
+typedef void(__cdecl* PatchDaePreAllFunc)(const char*);
+void CallPatchDaePreAllFromDLL(const std::string& path)
+{
+    HMODULE dll = LoadLibraryA("tinyxml2patcher.dll");
+    if (!dll) {
+        std::cerr << "Failed to load tinyxml2patcher.dll" << std::endl;
+        return;
+    }
+
+    PatchDaePreAllFunc patchFunc = (PatchDaePreAllFunc)GetProcAddress(dll, "PatchDaePreAll_C");
+    if (!patchFunc) {
+        std::cerr << "Failed to find PatchDaePreAll_C in DLL" << std::endl;
+        FreeLibrary(dll);
+        return;
+    }
+
+    patchFunc(path.c_str());
     FreeLibrary(dll);
 }
 
@@ -620,8 +666,9 @@ std::string MakeAbsolutePath(const std::string& path)
 #endif
 }
 
-// define global logPath
+// define globals
 std::string logPath;
+std::string exeDir;
 
 // ========================================================
 // ========================================================
@@ -637,7 +684,7 @@ int main(int argc, char* argv[])
     GetModuleFileNameA(NULL, exePath, MAX_PATH);
     std::string pathStr(exePath);
     size_t pos = pathStr.find_last_of("\\/");
-    std::string exeDir = (pos == std::string::npos) ? "." : pathStr.substr(0, pos);
+    exeDir = (pos == std::string::npos) ? "." : pathStr.substr(0, pos);
     logPath = exeDir + "\\message.log";
     std::ofstream(logPath.c_str(), std::ios::trunc) << "Unspecified error, contact @blurro on discord";
 
@@ -670,7 +717,7 @@ int main(int argc, char* argv[])
 
 	// debug default file path
     //if (filePathInput.empty()) filePathInput = "./KP_L_R_area3.bin";
-    //if (filePathInput.empty()) filePathInput = "C:/Users/Blurro/Desktop/My Stuff/Games/Emulation/MarioKartArcadeGPDX/Mario Kart DX 1.18/Data/Model/driver/rosetta/rosetta_model og_out.dae";
+    //if (filePathInput.empty()) filePathInput = "C:\\Users\\Blurro\\Downloads\\64646464.dae";
     //if (filePathInput.empty()) { filePathInput = "C:/Users/Blurro/source/repos/MKDXdaeconvert/x64/Debug/brian/briannn.dae"; arg2 = "C:/Users/Blurro/source/repos/MKDXdaeconvert/x64/Debug/brian/BrianPreset.txt"; }
 
     if (filePathInput.empty()) {
@@ -705,7 +752,7 @@ int main(int argc, char* argv[])
         SaveDaeFile(filePathInput, outDir, data.headerData, data.materialsData, data.textureNames, data.nodeLinks, data.allNodeNames, data.rootNodes, data.fullNodeDataList, mergeOn);
         //SaveMKDXFile(filePathInput, data.headerData, data.materialsData, data.textureNames, data.boneNames, data.nodeLinks, data.allNodeNames, data.rootNodes, data.fullNodeDataList); // debug remake file
     }
-    else if (ext == ".dae")
+    else if (ext == ".dae" || ext == ".fbx")
     {
         for (int i = 2; i < argc; i++) {
             std::string arg = argv[i];
@@ -717,7 +764,26 @@ int main(int argc, char* argv[])
         // FIRE LOGO PRINT
         FireLogoPrint(56);
 
-        filePathInput = CloneAndFixFBXASC(filePathInput);
+        if (ext == ".fbx")
+        {
+            std::string fbxPath = filePathInput;
+             
+            size_t pos = filePathInput.find_last_of('.');
+            if (pos != std::string::npos)
+                filePathInput = filePathInput.substr(0, pos) + ".dae";
+
+            struct stat buf;
+            std::string exePath = exeDir + "\\fbxtool\\FbxConverter.exe";
+            if (stat(exePath.c_str(), &buf) != 0) {
+                std::ofstream(logPath.c_str(), std::ios::trunc) << "Error: /fbxtool/FbxConverter.exe doesnt exist, cant continue";
+                exit(EXIT_FAILURE);
+            }
+            std::string cmd = "\"" + exePath + "\" \"" + fbxPath + "\" \"" + filePathInput + "\"";
+            cmd = "\"" + cmd + "\"";
+            system(cmd.c_str());
+        }
+        filePathInput = CloneAndFixFBXASC(filePathInput, ext == ".fbx"); // doesnt clone dae if og file is fbx tho
+        CallPatchDaePreAllFromDLL(filePathInput); // moves things from outside armature to inside armature
 
         Assimp::Importer importer;
         const aiScene* scene = importer.ReadFile(filePathInput, aiProcess_Triangulate);
@@ -1019,11 +1085,11 @@ int main(int argc, char* argv[])
                 aiQuaterniont<float> rotationQuat;
                 node->mTransformation.Decompose(scale, rotationQuat, position);
 
-                std::vector<float> rotationEuler = QuaternionToEulerXYZ(rotationQuat);
+                aiVector3D rotationEuler = MatrixToEulerXYZ(node->mTransformation);
 
                 fnd.boneData.Scale = { scale.x, scale.y, scale.z };
                 fnd.boneData.Translation = { position.x, position.y, position.z };
-                fnd.boneData.Rotation = { rotationEuler[0], rotationEuler[1], rotationEuler[2]};
+                fnd.boneData.Rotation = { rotationEuler.x, rotationEuler.y, rotationEuler.z };
 
                 fullNodeDataList.push_back(fnd);
 
