@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="utf-8"?>
+<PipelineBuildEvent xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:xsd="http://www.w3.org/2001/XMLSchema">
+  <SourceFile>C:/Users/Blurro/source/repos/MKDXdaeconvert/MaterialGuiMonogame/MaterialGuiMonogame/Content/File.spritefont</SourceFile>
+  <SourceTime>2025-09-21T23:51:03.1831617+01:00</SourceTime>
+  <DestFile>C:/Users/Blurro/source/repos/MKDXdaeconvert/MaterialGuiMonogame/MaterialGuiMonogame/Content/bin/Windows/NintyFont.xnb</DestFile>
+  <DestTime>2025-09-21T23:51:06.7169389+01:00</DestTime>
+  <Importer>FontDescriptionImporter</Importer>
+  <ImporterTime>2025-06-02T11:31:02+01:00</ImporterTime>
+  <Processor>LocalizedFontProcessor</Processor>
+  <ProcessorTime>2025-06-02T11:31:02+01:00</ProcessorTime>
+  <Parameters>
+    <Key>PremultiplyAlpha</Key>
+    <Value>True</Value>
+  </Parameters>
+  <Parameters>
+    <Key>TextureFormat</Key>
+    <Value>Compressed</Value>
+  </Parameters>
+  <Dependencies />
+  <BuildAsset />
+  <BuildOutput />
+</PipelineBuildEvent>

@@ -1,0 +1,3 @@
+Source File,Dest File,Processor Type,Content Type,Source File Size,Dest File Size,Build Seconds
+"C:/Users/Blurro/source/repos/MKDXdaeconvert/MaterialGuiMonogame/MaterialGuiMonogame/Content/File.spritefont","C:/Users/Blurro/source/repos/MKDXdaeconvert/MaterialGuiMonogame/MaterialGuiMonogame/Content/bin/Windows/Content/NintyFont.xnb","LocalizedFontProcessor","SpriteFontContent",2488,136217,0.171723
+"C:/Users/Blurro/source/repos/MKDXdaeconvert/MaterialGuiMonogame/MaterialGuiMonogame/Content/plan.png","C:/Users/Blurro/source/repos/MKDXdaeconvert/MaterialGuiMonogame/MaterialGuiMonogame/Content/bin/Windows/Content/plan.xnb","TextureProcessor","Texture2DContent",58573,1970461,0.152995

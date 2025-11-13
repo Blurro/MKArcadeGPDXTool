@@ -122,47 +122,58 @@ std::string ReadCStringAtOffset(std::istream& stream, uint32_t pointer) {
     return result;
 }
 
-aiVector3D MatrixToEulerXYZ(const aiMatrix4x4& m)
+static inline double clamp1(double v) {
+    if (v < -1.0) return -1.0;
+    if (v > 1.0) return  1.0;
+    return v;
+}
+
+// Decompose R = Rz(z) * Ry(y) * Rx(x)  (extrinsic ZYX), returns radians.
+aiVector3D MatrixToEulerZYX(const aiMatrix4x4& M)
 {
-    // Extract pure rotation part (strip translation and scale)
-    aiVector3D xAxis(m.a1, m.b1, m.c1);
-    aiVector3D yAxis(m.a2, m.b2, m.c2);
-    aiVector3D zAxis(m.a3, m.b3, m.c3);
+    // Orthonormalize columns (remove scale/shear; enforce right-handed)
+    aiVector3D c0(M.a1, M.b1, M.c1);
+    aiVector3D c1(M.a2, M.b2, M.c2);
+    aiVector3D c2 = c0 ^ c1;   // z = x × y
+    c1 = c2 ^ c0;              // re-orthogonalize y
 
-    // Normalize axes to remove scale
-    xAxis.Normalize();
-    yAxis.Normalize();
-    zAxis.Normalize();
+    c0.Normalize();
+    c1.Normalize();
+    c2.Normalize();
 
-    // Build normalized rotation matrix
-    double r00 = xAxis.x, r01 = yAxis.x, r02 = zAxis.x;
-    double r10 = xAxis.y, r11 = yAxis.y, r12 = zAxis.y;
-    double r20 = xAxis.z, r21 = yAxis.z, r22 = zAxis.z;
+    // Row-major elements from orthonormal columns
+    const double r00 = c0.x, r01 = c1.x, r02 = c2.x;
+    const double r10 = c0.y, r11 = c1.y, r12 = c2.y;
+    const double r20 = c0.z, r21 = c1.z, r22 = c2.z;
 
-    aiVector3D euler;
+    aiVector3D e; // x,y,z (roll,pitch,yaw)
 
-    // XYZ rotation order (same as Maya/Blender default)
-    if (r02 < 1.0) {
-        if (r02 > -1.0) {
-            euler.y = std::asin(r02);                 // Y
-            euler.x = std::atan2(-r12, r22);          // X
-            euler.z = std::atan2(-r01, r00);          // Z
-        }
-        else {
-            // r02 == -1 -> -90° gimbal lock
-            euler.y = -AI_MATH_PI / 2.0;
-            euler.x = -std::atan2(r10, r11);
-            euler.z = 0.0;
-        }
-    }
-    else {
-        // r02 == +1 -> +90° gimbal lock
-        euler.y = AI_MATH_PI / 2.0;
-        euler.x = std::atan2(r10, r11);
-        euler.z = 0.0;
+    const double eps = 1e-6;
+    const double c_r20 = clamp1(r20);
+
+    // General case
+    if (std::fabs(c_r20) < 1.0 - eps) {
+        e.y = std::asin(-c_r20);   // pitch
+        e.x = std::atan2(r21, r22); // roll
+        e.z = std::atan2(r10, r00); // yaw
+        return e;
     }
 
-    return euler; // in radians, XYZ order
+    // Gimbal lock
+    if (c_r20 > 0.0) { // r20 ≈ +1  -> y ≈ -pi/2
+        e.y = -AI_MATH_PI / 2.0;
+        // Choose z = 0, fold into x so that -90,-90,0 stays -90,-90,0
+        e.x = std::atan2(-r12, r11);
+        e.z = 0.0;
+    }
+    else {           // r20 ≈ -1  -> y ≈ +pi/2
+        e.y = AI_MATH_PI / 2.0;
+        // Choose z = 0, fold sign the other way
+        e.x = std::atan2(r12, r11);
+        e.z = 0.0;
+    }
+
+    return e;
 }
 
 std::string CloneAndFixFBXASC(const std::string& originalPath, bool fbx) {
@@ -343,8 +354,10 @@ void CallPatchDaePreAllFromDLL(const std::string& path)
 Header ReadHeader(std::istream& stream) {
     char sig[4];
     stream.read(sig, 4);
-    if (std::string(sig, 4) != "BIKE")
+    if (std::string(sig, 4) != "BIKE") {
+        std::ofstream(logPath.c_str(), std::ios::trunc) << "Invalid file signature. Expected 'BIKE'.";
         throw std::runtime_error("Invalid file signature. Expected 'BIKE'.");
+    }
 
     Header h;
     h.Type = ReadUInt16s(stream, 1)[0];
@@ -669,6 +682,7 @@ std::string MakeAbsolutePath(const std::string& path)
 // define globals
 std::string logPath;
 std::string exeDir;
+int numBinFilesWithErrors = 0;
 
 // ========================================================
 // ========================================================
@@ -727,725 +741,853 @@ int main(int argc, char* argv[])
         return 0;
     }
 
-    std::ifstream fs(filePathInput, std::ios::binary);
-    if (!fs) {
-        std::cerr << "Failed to open file: " << filePathInput << "\n";
-        std::ofstream(logPath.c_str(), std::ios::trunc) << "Error: failed to open input file";
-        //system("pause");
-        return 1;
+    // check file or folder
+    struct stat buf;
+    bool isFile = false, isDir = false;
+    if (stat(filePathInput.c_str(), &buf) == 0) {
+        isFile = (buf.st_mode & S_IFREG) != 0;
+        if (!isFile)
+            isDir = (buf.st_mode & S_IFDIR) != 0;
     }
-
-    std::string ext = filePathInput.substr(filePathInput.find_last_of('.'));
-    if (ext == ".bin")
+    if (isFile)
     {
-        for (int i = 2; i < argc; i++) {
-            if (strcmp(argv[i], "m") == 0) {
-                mergeOn = true;
-				std::cout << "Merging enabled\n";
-            }
-        }
-        // FIRE LOGO PRINT
-        FireLogoPrint(56);
-
-        MKDXData data = LoadMKDXFile(fs);
-
-        SaveDaeFile(filePathInput, outDir, data.headerData, data.materialsData, data.textureNames, data.nodeLinks, data.allNodeNames, data.rootNodes, data.fullNodeDataList, mergeOn);
-        //SaveMKDXFile(filePathInput, data.headerData, data.materialsData, data.textureNames, data.boneNames, data.nodeLinks, data.allNodeNames, data.rootNodes, data.fullNodeDataList); // debug remake file
-    }
-    else if (ext == ".dae" || ext == ".fbx")
-    {
-        for (int i = 2; i < argc; i++) {
-            std::string arg = argv[i];
-            if (arg.size() > 4 && arg.substr(arg.size() - 4) == ".txt") {
-                txtFilePath = arg;
-                break;
-            }
-        }
-        // FIRE LOGO PRINT
-        FireLogoPrint(56);
-
-        if (ext == ".fbx")
-        {
-            std::string fbxPath = filePathInput;
-             
-            size_t pos = filePathInput.find_last_of('.');
-            if (pos != std::string::npos)
-                filePathInput = filePathInput.substr(0, pos) + ".dae";
-
-            struct stat buf;
-            std::string exePath = exeDir + "\\fbxtool\\FbxConverter.exe";
-            if (stat(exePath.c_str(), &buf) != 0) {
-                std::ofstream(logPath.c_str(), std::ios::trunc) << "Error: /fbxtool/FbxConverter.exe doesnt exist, cant continue";
-                exit(EXIT_FAILURE);
-            }
-            std::string cmd = "\"" + exePath + "\" \"" + fbxPath + "\" \"" + filePathInput + "\"";
-            cmd = "\"" + cmd + "\"";
-            system(cmd.c_str());
-        }
-        filePathInput = CloneAndFixFBXASC(filePathInput, ext == ".fbx"); // doesnt clone dae if og file is fbx tho
-        CallPatchDaePreAllFromDLL(filePathInput); // moves things from outside armature to inside armature
-
-        Assimp::Importer importer;
-        const aiScene* scene = importer.ReadFile(filePathInput, aiProcess_Triangulate);
-
-        if (!scene || !scene->HasMeshes()) {
-            std::cerr << "failed to load scene or no meshes found\n";
-            std::ofstream(logPath.c_str(), std::ios::trunc) << "Error: failed to load scene or no meshes found";
+        // IF INPUT IS SINGLE FILE
+        std::ifstream fs(filePathInput, std::ios::binary);
+        if (!fs) {
+            std::cerr << "Failed to open file: " << filePathInput << "\n";
+            std::ofstream(logPath.c_str(), std::ios::trunc) << "Error: failed to open input file";
             //system("pause");
             return 1;
         }
 
-        for (unsigned int i = 0; i < scene->mNumMeshes; ++i) {
-            aiMesh* mesh = scene->mMeshes[i];
-            std::cout << "\nmesh #" << i << "\n";
-            std::cout << "  name: " << (mesh->mName.length > 0 ? mesh->mName.C_Str() : "(unnamed, this'll cause errors tell @blurro)") << "\n";
-            std::cout << "  vertices: " << mesh->mNumVertices << "\n";
-            std::cout << "  faces: " << mesh->mNumFaces << "\n";
+        std::string ext = filePathInput.substr(filePathInput.find_last_of('.'));
+        if (ext == ".bin")
+        {
+            for (int i = 2; i < argc; i++) {
+                if (strcmp(argv[i], "m") == 0) {
+                    mergeOn = true;
+                    std::cout << "Merging enabled\n";
+                }
+            }
+            // FIRE LOGO PRINT
+            FireLogoPrint(56);
 
-            if (mesh->mMaterialIndex < scene->mNumMaterials) {
-                aiMaterial* mat = scene->mMaterials[mesh->mMaterialIndex];
-                aiString matName;
-                mat->Get(AI_MATKEY_NAME, matName);
-                std::cout << "  material: " << matName.C_Str() << "\n";
-            }
-            else {
-                std::cout << "  material: (invalid index)\n";
-            }
+            MKDXData data = LoadMKDXFile(fs);
+
+            SaveDaeFile(filePathInput, outDir, data.headerData, data.materialsData, data.textureNames, data.nodeLinks, data.allNodeNames, data.rootNodes, data.fullNodeDataList, mergeOn);
+            //SaveMKDXFile(filePathInput, data.headerData, data.materialsData, data.textureNames, data.boneNames, data.nodeLinks, data.allNodeNames, data.rootNodes, data.fullNodeDataList); // debug remake file
         }
-
-        std::cout << "\nExpected number of materials in preset file: " << scene->mNumMaterials << "\n";
-        std::string presetPath;
-        if (!txtFilePath.empty() && txtFilePath.size() >= 4 && txtFilePath.substr(txtFilePath.size() - 4) == ".txt") {
-            std::ifstream testFile(txtFilePath);
-            if (testFile.good()) presetPath = txtFilePath;
+		else if (ext == ".mot")
+		{
+            std::ofstream(logPath.c_str(), std::ios::trunc) << "Animation file support coming in V1.9\nMessage @blurro on discord to hurry it up!";
         }
-        if (presetPath.empty()) {
-			if (outDirEmpty) {
-                std::cout << "Enter material preset txt file path (leave blank to generate default): ";
-                std::getline(std::cin, presetPath);
-			}
-            else {
-                std::ofstream(logPath.c_str(), std::ios::trunc) << "Error: invalid material preset txt";
-                return 1;
-            }
-        }
-
-        //presetPath = "RosalinaPreset.txt"; // debug path
-
-        // try opening the file to check if it exists
-        presetPath.erase(std::remove(presetPath.begin(), presetPath.end(), '\"'), presetPath.end());
-        std::ifstream check(presetPath);
-        if (presetPath.empty() || !check.is_open()) {
-            presetPath = "ExampleMatPreset.txt";
-            std::ofstream out(presetPath);
-            out << "//material 1, this is Mario's\n";
-            out << "#Material\n";
-            out << "#DIFFUSE 0.5 0.5 0.5 1\n";
-            out << "#SPECULAR 0.7 0.7 0.7 1\n";
-            out << "#AMBIENCE 1 1 1 1\n";
-            out << "#SHINY 1\n";
-            out << "#TEXALBEDO 0\n";
-            out << "#TEXSPECULAR 1\n";
-            out << "#TEXREFLECTIVE -1\n";
-            out << "#TEXENVIRONMENT -1\n";
-            out << "#TEXNORMAL -1\n\n";
-
-            out << "//next material starts with the same tag, make sure the amount of '#Material's matches the .dae file!\n";
-            out << "//anything not stated will use default values (same values as above, but any undefined '#TEX' is defaulted to '-1')\n";
-            out << "#Material\n";
-            out << "#TEXALBEDO 2\n\n";
-
-            out << "//only have one '#Textures', all following lines will be the textures the file references\n";
-            out << "#Textures\n";
-            out << "mario_body01_col.dds\n";
-            out << "mario_body01_spe.dds\n";
-            out << "material_2_albedo_example.dds\n";
-            out.close();
-
-            std::cout << "No input, generated example preset file: " << presetPath << "\n";
-        }
-        else {
-            std::cout << "Using material preset file: " << presetPath << "\n";
-
-            std::ifstream presetFile(presetPath);
-            if (!presetFile) {
-                std::cerr << "failed to open preset file: " << presetPath << "\n";
-                std::ofstream(logPath.c_str(), std::ios::trunc) << "Error: failed to open preset file";
-                //system("pause");
-                return 1;
-            }
-
-            std::vector<MaterialPreset> materials;
-            std::vector<TextureName> textureNames;
-            std::vector<std::string> meshList;
-            std::string line;
-            int lineNumber = 0;
-            bool inTextures = false;
-            bool inMeshes = false;
-
-            auto readFloats = [&](std::istringstream& s, float* dst, int count) {
-                for (int i = 0; i < count; ++i) {
-                    if (!(s >> dst[i])) {
-                        std::cerr << "line " << lineNumber << ": expected " << count << " floats\n";
-                        return false;
-                    }
-                }
-                return true;
-                };
-
-            auto readInt = [&](std::istringstream& s, int& dst) {
-                if (!(s >> dst)) {
-                    std::cerr << "line " << lineNumber << ": expected 1 int\n";
-                    return false;
-                }
-                return true;
-                };
-
-            std::map<std::string, std::array<float, 6>> animFloatMap;
-            MaterialPreset currentMat;
-            bool haveMaterial = false;
-            try {
-                while (std::getline(presetFile, line)) {
-                    ++lineNumber;
-                    if (line.empty()) continue;
-                    if (line[0] == '/' || line[0] == ' ') continue;
-
-                    std::istringstream iss(line);
-                    std::string tag;
-                    iss >> tag;
-
-                    if (tag == "#Material") {
-                        if (!materials.empty() || lineNumber != 1) {
-                            materials.push_back(currentMat);
-                        }
-                        currentMat = MaterialPreset();
-                        haveMaterial = true;
-                        inTextures = false;
-                        inMeshes = false;
-                        continue;
-                    }
-
-                    if (tag == "#AnimFloats") {
-                        std::string boneName;
-                        float v0, v1, v2, v3, v4, v5;
-                        if (iss >> boneName >> v0 >> v1 >> v2 >> v3 >> v4 >> v5) {
-                            animFloatMap[boneName] = { v0, v1, v2, v3, v4, v5 };
-                        }
-                        else {
-                            printf("Invalid #AnimFloats line on %d\n", lineNumber);
-                        }
-                        continue;
-                    }
-
-                    if (tag == "#Textures") {
-                        inTextures = true;
-                        inMeshes = false;
-                        continue;
-                    }
-                    if (tag == "#Meshes") {
-                        inTextures = false;
-                        inMeshes = true;
-                        continue;
-                    }
-
-                    // if line starts with # then not reading names anymore
-                    if (inTextures) {
-                        if (tag[0] == '#') inTextures = false;
-                        else textureNames.push_back({ line, 0 }); // 0 for NamePointer for now
-                        continue;
-                    }
-                    if (inMeshes) {
-                        if (tag[0] == '#') inMeshes = false;
-                        else meshList.push_back(line);
-                        continue;
-                    }
-
-                    if (tag == "#DIFFUSE") readFloats(iss, currentMat.diffuse, 4);
-                    else if (tag == "#SPECULAR") readFloats(iss, currentMat.specular, 4);
-                    else if (tag == "#AMBIENCE") readFloats(iss, currentMat.ambience, 4);
-                    else if (tag == "#SHINY") readFloats(iss, &currentMat.shiny, 1);
-                    else if (tag == "#TEXALBEDO") readInt(iss, currentMat.texAlbedo);
-                    else if (tag == "#TEXSPECULAR") readInt(iss, currentMat.texSpecular);
-                    else if (tag == "#TEXREFLECTIVE") readInt(iss, currentMat.texReflective);
-                    else if (tag == "#TEXENVIRONMENT") readInt(iss, currentMat.texEnvironment);
-                    else if (tag == "#TEXNORMAL") readInt(iss, currentMat.texNormal);
-                    else if (tag == "#UNKNOWN") readInt(iss, currentMat.unknownVal);
-                    else if (tag == "#UNKNOWN2") readFloats(iss, &currentMat.unknownVal2, 1);
-                    else std::cerr << "line " << lineNumber << ": unknown tag: " << tag << "\n";
-                }
-                if (haveMaterial) {
-                    materials.push_back(currentMat);
+        else if (ext == ".dae" || ext == ".fbx")
+        {
+            for (int i = 2; i < argc; i++) {
+                std::string arg = argv[i];
+                if (arg.size() > 4 && arg.substr(arg.size() - 4) == ".txt") {
+                    txtFilePath = arg;
+                    break;
                 }
             }
-            catch (const std::exception& e) {
-                std::string errMsg = std::string("Exception while reading preset file at line ") + std::to_string(lineNumber) + ": " + e.what() + "\n";
-                std::cerr << errMsg;
-                std::ofstream(logPath.c_str(), std::ios::app) << errMsg;
-                return 1;
-            }
+            // FIRE LOGO PRINT
+            FireLogoPrint(56);
 
-            if (textureNames.size() == 0) {
-                std::cerr << "no #Textures block found\n";
-            }
-            if (meshList.size() == 0) {
-                std::cerr << "no #Meshes block found\n";
-            }
-            int dummyMat = 0;
-            if (materials.size() == scene->mNumMaterials + 1) {
-                const auto& first = materials[0];
-                if (first.texAlbedo == -1 && first.texSpecular == -1 && first.texReflective == -1 &&
-                    first.texEnvironment == -1 && first.texNormal == -1) {
-                    dummyMat = 1;
-                    std::cout << "\nDetected and adding absent-from-dae dummy material from preset\n\n";
+            if (ext == ".fbx")
+            {
+                struct stat buf;
+                std::string fbxPath = filePathInput;
+
+                size_t pos = filePathInput.find_last_of('.');
+                if (pos != std::string::npos)
+                    filePathInput = filePathInput.substr(0, pos) + ".dae";
+
+                std::string exePath = exeDir + "\\fbxtool\\FbxConverter.exe";
+                if (stat(exePath.c_str(), &buf) != 0) {
+                    std::ofstream(logPath.c_str(), std::ios::trunc) << "Error: /fbxtool/FbxConverter.exe doesnt exist, cant continue";
+                    exit(EXIT_FAILURE);
+                }
+
+                if (stat(filePathInput.c_str(), &buf) == 0)
+                    std::remove(filePathInput.c_str());
+
+                std::string cmd = "\"" + exePath + "\" \"" + fbxPath + "\" \"" + filePathInput + "\"";
+                cmd = "\"" + cmd + "\"";
+                system(cmd.c_str());
+
+                // check if output .dae exists, otherwise fail
+                if (stat(filePathInput.c_str(), &buf) != 0) {
+                    std::cerr << "Error: FBX couldn't be read! Sanitize it via re-exporting through Blender and try again\n";
+                    std::ofstream(logPath.c_str(), std::ios::trunc) << "Error: FBX couldn't be read! Sanitize it via re-exporting through Blender and try again";
+                    exit(EXIT_FAILURE);
                 }
             }
-            if (materials.size() != scene->mNumMaterials + dummyMat) {
-                std::string errMsg = "Error: expected " + std::to_string(scene->mNumMaterials) +
-                    " materials, but loaded " + std::to_string(materials.size()) + " from preset\n";
-                std::cerr << errMsg;
-                std::ofstream(logPath.c_str(), std::ios::trunc) << errMsg;
-                //system("pause");
-                return 1;
-            }
-            std::cout << "loaded " << materials.size() << " materials, " << textureNames.size() << " textures, and " << meshList.size() << " meshes" << "\n";
-
-            // func that splits meshes into submeshes based on bone counts per triangle
-            CallPatchDaePreImportFromDLL(filePathInput, "final_groups.t");
-
-            // modify dae.tmp file to treat non-listed child mesh nodes of a listed mesh node as being submeshes of that listed mesh
-            CallNodeToSubmeshFromDLL(filePathInput, meshList);
-            
-            // reload scene
-            scene = importer.ReadFile(filePathInput, aiProcess_Triangulate | aiProcess_JoinIdenticalVertices);
-
-            // assign some header data
-			Header headerData;
-			headerData.MaterialCount = static_cast<uint32_t>(materials.size());
-			headerData.TextureMapsCount = static_cast<uint32_t>(textureNames.size());
-
-            // load node names and retrieve counts
-            int totalNodeCount = 0;
-            std::vector<std::string> nonMeshNodes;
-            std::vector<NodeNames> allNodeNames;
-            std::vector<FullNodeData> fullNodeDataList;
-            std::vector<aiNode*> stack;
-
-            aiNode* root = scene->mRootNode;
-
-            // always skip the first node (scene), then skip "Armature" if present
-            std::vector<aiNode*> nodesToProcess;
-            if (root) {
-                std::cout << "Top-level root node: \"" << root->mName.C_Str() << "\" with " << root->mNumChildren << " child(ren)\n";
-
-                aiNode* armatureNode = nullptr;
-                for (unsigned int i = 0; i < root->mNumChildren; ++i) {
-                    aiNode* child = root->mChildren[i];
-                    std::string name = child->mName.C_Str();
-                    std::cout << "  child[" << i << "] = " << name << "\n";
-
-                    if (name == "Armature") {
-                        armatureNode = child;
+            else { // if dae file check if its a blender one
+                std::ifstream in(filePathInput);
+                if (in) {
+                    std::string line;
+                    while (std::getline(in, line)) {
+                        std::string lowerLine = line;
+                        std::transform(lowerLine.begin(), lowerLine.end(), lowerLine.begin(), ::tolower);
+                        if (lowerLine.find("<author>blender") != std::string::npos ||
+                            lowerLine.find("<authoring_tool>blender") != std::string::npos ||
+                            lowerLine.find("<technique profile=\"blender\"") != std::string::npos)
+                            std::cerr << "Error: Don't input a Blender exported collada, please use FBX!\n";
+                        std::ofstream(logPath.c_str(), std::ios::trunc) << "Error: Don't input a Blender exported collada, please use FBX!";
+                        exit(EXIT_FAILURE);
                         break;
                     }
                 }
-                if (armatureNode) {
-                    std::cout << "Found \"Armature\" node with " << armatureNode->mNumChildren << " child(ren). Processing those.\n";
-                    for (unsigned int i = 0; i < armatureNode->mNumChildren; ++i)
-                        nodesToProcess.push_back(armatureNode->mChildren[i]);
-                }
-                else {
-                    std::cout << "No \"Armature\" found. Processing children of Scene root directly.\n";
-                    for (unsigned int i = 0; i < root->mNumChildren; ++i)
-                        nodesToProcess.push_back(root->mChildren[i]);
-                }
+                in.close();
+            }
+            filePathInput = CloneAndFixFBXASC(filePathInput, ext == ".fbx"); // doesnt clone dae if og file is fbx tho
+            CallPatchDaePreAllFromDLL(filePathInput); // moves things from outside armature to inside armature
+
+            Assimp::Importer importer;
+            const aiScene* scene = importer.ReadFile(filePathInput, aiProcess_Triangulate);
+
+            if (!scene || !scene->HasMeshes()) {
+                std::cerr << "failed to load scene or no meshes found\n";
+                std::ofstream(logPath.c_str(), std::ios::trunc) << "Error: failed to load scene or no meshes found";
+                //system("pause");
+                return 1;
             }
 
-            for (aiNode* n : nodesToProcess)
-                stack.push_back(n);
-
-            std::vector<aiNode*> allAiNodes; // rearranged nodes to match the order of fullNodeDataList
-            while (!stack.empty()) {
-                aiNode* node = stack.back();
-                allAiNodes.push_back(node);
-                stack.pop_back();
-
-                totalNodeCount++;
-
-                NodeNames entry;
-                entry.Name = node->mName.C_Str();
-                entry.DataOffset = static_cast<uint32_t>(allNodeNames.size()); // gives unique id to the dataoffset, needed for linking nodenames to bonenames later in the save code
-                entry.NamePointer = 0;
-                allNodeNames.push_back(entry);
-
-                if (node->mNumMeshes == 0)
-                    nonMeshNodes.push_back(node->mName.C_Str());
-
-                FullNodeData fnd;
-                aiVector3t<float> scale, position;
-                aiQuaterniont<float> rotationQuat;
-                node->mTransformation.Decompose(scale, rotationQuat, position);
-
-                aiVector3D rotationEuler = MatrixToEulerXYZ(node->mTransformation);
-
-                fnd.boneData.Scale = { scale.x, scale.y, scale.z };
-                fnd.boneData.Translation = { position.x, position.y, position.z };
-                fnd.boneData.Rotation = { rotationEuler.x, rotationEuler.y, rotationEuler.z };
-
-                fullNodeDataList.push_back(fnd);
-
-                for (int i = node->mNumChildren - 1; i >= 0; --i)
-                    stack.push_back(node->mChildren[i]);
-            }
-
-            std::cout << "\ntotal nodes (excluding dummy parents): " << totalNodeCount << "\n";
-            std::cout << "non-mesh nodes: " << nonMeshNodes.size() << "\n";
-
-			// add children indices to childrenIndexList in FullNodeData
-            for (size_t parentIdx = 0; parentIdx < allAiNodes.size(); ++parentIdx) {
-                aiNode* parentNode = allAiNodes[parentIdx];
-                for (unsigned int i = 0; i < parentNode->mNumChildren; ++i) {
-                    aiNode* child = parentNode->mChildren[i];
-
-                    // find the index of this child in allAiNodes
-                    auto it = std::find(allAiNodes.begin(), allAiNodes.end(), child);
-                    if (it != allAiNodes.end()) {
-                        size_t childIdx = std::distance(allAiNodes.begin(), it);
-                        fullNodeDataList[parentIdx].childrenIndexList.push_back(static_cast<uint32_t>(childIdx));
-                    }
-                }
-            }
-
-			// pick root nodes out of all nodes by checking if they are not in any childIndices
-            std::vector<uint32_t> rootNodes;
-            std::unordered_set<uint32_t> childIndices;
-            for (const auto& fnd : fullNodeDataList) {
-                for (auto childIdx : fnd.childrenIndexList)
-                    childIndices.insert(childIdx);
-            }
-            for (uint32_t i = 0; i < fullNodeDataList.size(); ++i) {
-                if (childIndices.find(i) == childIndices.end()) {
-                    rootNodes.push_back(i);
-                }
-            }
-
-            // debug print
-            //std::cout << "\nall nodes in order:\n"; for (const auto& node : allNodeNames) std::cout << "  " << node.Name << "\n";
-
-            // create allBoneNames vector with struct NodeNames, keeping DataOffset same as original nodes
-            std::vector<NodeNames> boneNames;
-            boneNames.reserve(nonMeshNodes.size());
-
-            // first find matching DataOffset from allNodeNames for each bone name
-            for (const auto& boneNameStr : nonMeshNodes) {
-                auto it = std::find_if(allNodeNames.begin(), allNodeNames.end(), [&](const NodeNames& n) {
-                    return n.Name == boneNameStr;
-                    });
-                boneNames.push_back({ it->DataOffset, it->Name, 0 });
-            }
-            // sort allBoneNames by Name alphabetically with capitals first
-            std::sort(boneNames.begin(), boneNames.end(), [](const NodeNames& a, const NodeNames& b) {
-                size_t len = a.Name.size() < b.Name.size() ? a.Name.size() : b.Name.size();
-                for (size_t i = 0; i < len; ++i) {
-                    unsigned char c1 = a.Name[i];
-                    unsigned char c2 = b.Name[i];
-                    if (c1 != c2) {
-                        if (std::isupper(c1) && std::islower(c2)) return true;
-                        if (std::islower(c1) && std::isupper(c2)) return false;
-                        return c1 < c2;
-                    }
-                }
-                return a.Name.size() < b.Name.size();
-             });
-
-            // debug print the sorted bone names
-            //std::cout << "\nnon-mesh nodes (bones) sorted alphabetically (caps first):\n"; for (const auto& bone : allBoneNames) { std::cout << "  " << bone.Name << " (DataOffset " << bone.DataOffset << ")\n"; }
-
-            // assign more header stuffs
-            headerData.BoneCount = static_cast<uint32_t>(nonMeshNodes.size());
-            headerData.TotalNodeCount = static_cast<uint32_t>(totalNodeCount);
-
-			// turn material presets into materialsData list
-            std::vector<Material> materialsData;
-            materialsData.reserve(materials.size());
-            for (const auto& mat : materials) {
-                Material m;
-                m.Diffuse.assign(mat.diffuse, mat.diffuse + 4);
-                m.Specular.assign(mat.specular, mat.specular + 4);
-                m.Ambience.assign(mat.ambience, mat.ambience + 4);
-                m.Shiny = mat.shiny;
-                m.TextureIndices[0] = static_cast<int16_t>(mat.texAlbedo);
-                m.TextureIndices[1] = static_cast<int16_t>(mat.texSpecular);
-                m.TextureIndices[2] = static_cast<int16_t>(mat.texReflective);
-                m.TextureIndices[3] = static_cast<int16_t>(mat.texEnvironment);
-                m.TextureIndices[4] = static_cast<int16_t>(mat.texNormal);
-				m.Unknowns[0] = mat.unknownVal; // will try find out about it another time
-                m.Unknowns2[3] = mat.unknownVal2;
-                materialsData.push_back(m);
-            }
-
-            std::vector<NodeLinks> nodeLinks;
-            uint32_t totalLinksCount = 0;
-
-            // create sorted index view
-            std::vector<size_t> sortedIndices(allAiNodes.size());
-            for (size_t i = 0; i < sortedIndices.size(); ++i)
-                sortedIndices[i] = i;
-
-            // sort the indices based on allAiNodes names
-            for (size_t i = 0; i < sortedIndices.size(); ++i) {
-                for (size_t j = i + 1; j < sortedIndices.size(); ++j) {
-                    if (strcmp(allAiNodes[sortedIndices[i]]->mName.C_Str(), allAiNodes[sortedIndices[j]]->mName.C_Str()) > 0)
-                        std::swap(sortedIndices[i], sortedIndices[j]);
-                }
-            }
-
-            // fix material index on meshes (assimp loads in order of first used, not dae order)
-            auto meshMaterialMap = CallGetMaterialIndicesFromDLL(filePathInput);
             for (unsigned int i = 0; i < scene->mNumMeshes; ++i) {
                 aiMesh* mesh = scene->mMeshes[i];
-                auto found = meshMaterialMap.find(mesh->mName.C_Str());
-                if (found != meshMaterialMap.end()) {
-                    std::cout << "  overriding material index of mesh " << mesh->mName.C_Str() << " to " << found->second << "\n";
-                    scene->mMeshes[i]->mMaterialIndex = found->second;
+                std::cout << "\nmesh #" << i << "\n";
+                std::cout << "  name: " << (mesh->mName.length > 0 ? mesh->mName.C_Str() : "(unnamed, this'll cause errors tell @blurro)") << "\n";
+                std::cout << "  vertices: " << mesh->mNumVertices << "\n";
+                std::cout << "  faces: " << mesh->mNumFaces << "\n";
+
+                if (mesh->mMaterialIndex < scene->mNumMaterials) {
+                    aiMaterial* mat = scene->mMaterials[mesh->mMaterialIndex];
+                    aiString matName;
+                    mat->Get(AI_MATKEY_NAME, matName);
+                    std::cout << "  material: " << matName.C_Str() << "\n";
+                }
+                else {
+                    std::cout << "  material: (invalid index)\n";
                 }
             }
 
-            // loop in sorted order using the index indirection
-            for (size_t sortedIndex = 0; sortedIndex < sortedIndices.size(); ++sortedIndex) {
-                size_t originalIndex = sortedIndices[sortedIndex];
-                aiNode* node = allAiNodes[originalIndex];
+            std::cout << "\nExpected number of materials in preset file: " << scene->mNumMaterials << "\n";
+            std::string presetPath;
+            if (!txtFilePath.empty() && txtFilePath.size() >= 4 && txtFilePath.substr(txtFilePath.size() - 4) == ".txt") {
+                std::ifstream testFile(txtFilePath);
+                if (testFile.good()) presetPath = txtFilePath;
+            }
+            if (presetPath.empty()) {
+                if (outDirEmpty) {
+                    std::cout << "Enter material preset txt file path (leave blank to generate default): ";
+                    std::getline(std::cin, presetPath);
+                }
+                else {
+                    std::ofstream(logPath.c_str(), std::ios::trunc) << "Error: invalid material preset txt";
+                    return 1;
+                }
+            }
 
-                auto& fullNode = fullNodeDataList[originalIndex];
-                // find uniqueBoneIndices from all bones in meshes of this node (order from daeBoneList will reorder them later)
-                std::vector<uint32_t> uniqueBoneIndices;
-                if (node->mNumMeshes > 0) {
-                    for (unsigned int meshIdx = 0; meshIdx < node->mNumMeshes; ++meshIdx) {
-                        aiMesh* mesh = scene->mMeshes[node->mMeshes[meshIdx]];
-                        for (unsigned int b = 0; b < mesh->mNumBones; ++b) {
-                            std::string boneName = mesh->mBones[b]->mName.C_Str();
-                            for (size_t boneIdx = 0; boneIdx < allAiNodes.size(); ++boneIdx) {
-                                if (boneName == allAiNodes[boneIdx]->mName.C_Str()) {
-                                    if (std::find(uniqueBoneIndices.begin(), uniqueBoneIndices.end(), static_cast<uint32_t>(boneIdx)) == uniqueBoneIndices.end())
-                                        uniqueBoneIndices.push_back(static_cast<uint32_t>(boneIdx));
+            //presetPath = "RosalinaPreset.txt"; // debug path
+
+            // try opening the file to check if it exists
+            presetPath.erase(std::remove(presetPath.begin(), presetPath.end(), '\"'), presetPath.end());
+            std::ifstream check(presetPath);
+            if (presetPath.empty() || !check.is_open()) {
+                presetPath = "ExampleMatPreset.txt";
+                std::ofstream out(presetPath);
+                out << "//material 1, this is Mario's\n";
+                out << "#Material\n";
+                out << "#DIFFUSE 0.5 0.5 0.5 1\n";
+                out << "#SPECULAR 0.7 0.7 0.7 1\n";
+                out << "#AMBIENCE 1 1 1 1\n";
+                out << "#SHINY 1\n";
+                out << "#TEXALBEDO 0\n";
+                out << "#TEXSPECULAR 1\n";
+                out << "#TEXREFLECTIVE -1\n";
+                out << "#TEXENVIRONMENT -1\n";
+                out << "#TEXNORMAL -1\n\n";
+
+                out << "//next material starts with the same tag, make sure the amount of '#Material's matches the .dae file!\n";
+                out << "//anything not stated will use default values (same values as above, but any undefined '#TEX' is defaulted to '-1')\n";
+                out << "#Material\n";
+                out << "#TEXALBEDO 2\n\n";
+
+                out << "//only have one '#Textures', all following lines will be the textures the file references\n";
+                out << "#Textures\n";
+                out << "mario_body01_col.dds\n";
+                out << "mario_body01_spe.dds\n";
+                out << "material_2_albedo_example.dds\n";
+                out.close();
+
+                std::cout << "No input, generated example preset file: " << presetPath << "\n";
+            }
+            else {
+                std::cout << "Using material preset file: " << presetPath << "\n";
+
+                std::ifstream presetFile(presetPath);
+                if (!presetFile) {
+                    std::cerr << "failed to open preset file: " << presetPath << "\n";
+                    std::ofstream(logPath.c_str(), std::ios::trunc) << "Error: failed to open preset file";
+                    //system("pause");
+                    return 1;
+                }
+
+                std::vector<MaterialPreset> materials;
+                std::vector<TextureName> textureNames;
+                std::vector<std::string> meshList;
+                std::string line;
+                int lineNumber = 0;
+                bool inTextures = false;
+                bool inMeshes = false;
+
+                auto readFloats = [&](std::istringstream& s, float* dst, int count) {
+                    for (int i = 0; i < count; ++i) {
+                        if (!(s >> dst[i])) {
+                            std::cerr << "line " << lineNumber << ": expected " << count << " floats\n";
+                            return false;
+                        }
+                    }
+                    return true;
+                    };
+
+                auto readInt = [&](std::istringstream& s, int& dst) {
+                    if (!(s >> dst)) {
+                        std::cerr << "line " << lineNumber << ": expected 1 int\n";
+                        return false;
+                    }
+                    return true;
+                    };
+
+                std::map<std::string, std::array<float, 6>> animFloatMap;
+                MaterialPreset currentMat;
+                bool haveMaterial = false;
+                try {
+                    while (std::getline(presetFile, line)) {
+                        ++lineNumber;
+                        if (line.empty()) continue;
+                        if (line[0] == '/' || line[0] == ' ') continue;
+
+                        std::istringstream iss(line);
+                        std::string tag;
+                        iss >> tag;
+
+                        if (tag == "#Material") {
+                            if (!materials.empty() || lineNumber != 1) {
+                                materials.push_back(currentMat);
+                            }
+                            currentMat = MaterialPreset();
+                            haveMaterial = true;
+                            inTextures = false;
+                            inMeshes = false;
+                            continue;
+                        }
+
+                        if (tag == "#AnimFloats") {
+                            std::string boneName;
+                            float v0, v1, v2, v3, v4, v5;
+                            if (iss >> boneName >> v0 >> v1 >> v2 >> v3 >> v4 >> v5) {
+                                animFloatMap[boneName] = { v0, v1, v2, v3, v4, v5 };
+                            }
+                            else {
+                                printf("Invalid #AnimFloats line on %d\n", lineNumber);
+                            }
+                            continue;
+                        }
+
+                        if (tag == "#Textures") {
+                            inTextures = true;
+                            inMeshes = false;
+                            continue;
+                        }
+                        if (tag == "#Meshes") {
+                            inTextures = false;
+                            inMeshes = true;
+                            continue;
+                        }
+
+                        // if line starts with # then not reading names anymore
+                        if (inTextures) {
+                            if (tag[0] == '#') inTextures = false;
+                            else textureNames.push_back({ line, 0 }); // 0 for NamePointer for now
+                            continue;
+                        }
+                        if (inMeshes) {
+                            if (tag[0] == '#') inMeshes = false;
+                            else meshList.push_back(line);
+                            continue;
+                        }
+
+                        if (tag == "#DIFFUSE") readFloats(iss, currentMat.diffuse, 4);
+                        else if (tag == "#SPECULAR") readFloats(iss, currentMat.specular, 4);
+                        else if (tag == "#AMBIENCE") readFloats(iss, currentMat.ambience, 4);
+                        else if (tag == "#SHINY") readFloats(iss, &currentMat.shiny, 1);
+                        else if (tag == "#TEXALBEDO") readInt(iss, currentMat.texAlbedo);
+                        else if (tag == "#TEXSPECULAR") readInt(iss, currentMat.texSpecular);
+                        else if (tag == "#TEXREFLECTIVE") readInt(iss, currentMat.texReflective);
+                        else if (tag == "#TEXENVIRONMENT") readInt(iss, currentMat.texEnvironment);
+                        else if (tag == "#TEXNORMAL") readInt(iss, currentMat.texNormal);
+                        else if (tag == "#UNKNOWN") readInt(iss, currentMat.unknownVal);
+                        else if (tag == "#UNKNOWN2") readFloats(iss, &currentMat.unknownVal2, 1);
+                        else std::cerr << "line " << lineNumber << ": unknown tag: " << tag << "\n";
+                    }
+                    if (haveMaterial) {
+                        materials.push_back(currentMat);
+                    }
+                }
+                catch (const std::exception& e) {
+                    std::string errMsg = std::string("Exception while reading preset file at line ") + std::to_string(lineNumber) + ": " + e.what() + "\n";
+                    std::cerr << errMsg;
+                    std::ofstream(logPath.c_str(), std::ios::app) << errMsg;
+                    return 1;
+                }
+
+                if (textureNames.size() == 0) {
+                    std::cerr << "no #Textures block found\n";
+                }
+                if (meshList.size() == 0) {
+                    std::cerr << "no #Meshes block found\n";
+                }
+                int dummyMat = 0;
+                if (materials.size() == scene->mNumMaterials + 1) {
+                    const auto& first = materials[0];
+                    if (first.texAlbedo == -1 && first.texSpecular == -1 && first.texReflective == -1 &&
+                        first.texEnvironment == -1 && first.texNormal == -1) {
+                        dummyMat = 1;
+                        std::cout << "\nDetected and adding absent-from-dae dummy material from preset\n\n";
+                    }
+                }
+                if (materials.size() != scene->mNumMaterials + dummyMat) {
+                    std::string errMsg = "Error: expected " + std::to_string(scene->mNumMaterials) +
+                        " materials (+allowed 1 dummy), but loaded " + std::to_string(materials.size()) + " from preset\n";
+                    std::cerr << errMsg;
+                    std::ofstream(logPath.c_str(), std::ios::trunc) << errMsg;
+                    //system("pause");
+                    return 1;
+                }
+                std::cout << "loaded " << materials.size() << " materials, " << textureNames.size() << " textures, and " << meshList.size() << " meshes" << "\n";
+
+                // func that splits meshes into submeshes based on bone counts per triangle
+                CallPatchDaePreImportFromDLL(filePathInput, "final_groups.t");
+
+                // modify dae.tmp file to treat non-listed child mesh nodes of a listed mesh node as being submeshes of that listed mesh
+                CallNodeToSubmeshFromDLL(filePathInput, meshList);
+
+                // reload scene
+                scene = importer.ReadFile(filePathInput, aiProcess_Triangulate | aiProcess_JoinIdenticalVertices);
+
+                // assign some header data
+                Header headerData;
+                headerData.MaterialCount = static_cast<uint32_t>(materials.size());
+                headerData.TextureMapsCount = static_cast<uint32_t>(textureNames.size());
+
+                // load node names and retrieve counts
+                int totalNodeCount = 0;
+                std::vector<std::string> nonMeshNodes;
+                std::vector<NodeNames> allNodeNames;
+                std::vector<FullNodeData> fullNodeDataList;
+                std::vector<aiNode*> stack;
+
+                aiNode* root = scene->mRootNode;
+
+                // always skip the first node (scene), then skip "Armature" if present
+                std::vector<aiNode*> nodesToProcess;
+                if (root) {
+                    std::cout << "Top-level root node: \"" << root->mName.C_Str() << "\" with " << root->mNumChildren << " child(ren)\n";
+
+                    aiNode* armatureNode = nullptr;
+                    for (unsigned int i = 0; i < root->mNumChildren; ++i) {
+                        aiNode* child = root->mChildren[i];
+                        std::string name = child->mName.C_Str();
+                        std::cout << "  child[" << i << "] = " << name << "\n";
+
+                        if (name == "Armature") {
+                            armatureNode = child;
+                            break;
+                        }
+                    }
+                    if (armatureNode) {
+                        std::cout << "Found \"Armature\" node with " << armatureNode->mNumChildren << " child(ren). Processing those.\n";
+                        for (unsigned int i = 0; i < armatureNode->mNumChildren; ++i)
+                            nodesToProcess.push_back(armatureNode->mChildren[i]);
+                    }
+                    else {
+                        std::cout << "No \"Armature\" found. Processing children of Scene root directly.\n";
+                        for (unsigned int i = 0; i < root->mNumChildren; ++i)
+                            nodesToProcess.push_back(root->mChildren[i]);
+                    }
+                }
+
+                for (aiNode* n : nodesToProcess)
+                    stack.push_back(n);
+
+                std::vector<aiNode*> allAiNodes; // rearranged nodes to match the order of fullNodeDataList
+                while (!stack.empty()) {
+                    aiNode* node = stack.back();
+                    allAiNodes.push_back(node);
+                    stack.pop_back();
+
+                    totalNodeCount++;
+
+                    NodeNames entry;
+                    entry.Name = node->mName.C_Str();
+                    entry.DataOffset = static_cast<uint32_t>(allNodeNames.size()); // gives unique id to the dataoffset, needed for linking nodenames to bonenames later in the save code
+                    entry.NamePointer = 0;
+                    allNodeNames.push_back(entry);
+
+                    if (node->mNumMeshes == 0)
+                        nonMeshNodes.push_back(node->mName.C_Str());
+
+                    FullNodeData fnd;
+                    aiVector3t<float> scale, position;
+                    aiQuaterniont<float> rotationQuat;
+                    node->mTransformation.Decompose(scale, rotationQuat, position);
+
+                    aiVector3D rotationEuler = MatrixToEulerZYX(node->mTransformation);
+
+                    fnd.boneData.Scale = { scale.x, scale.y, scale.z };
+                    fnd.boneData.Translation = { position.x, position.y, position.z };
+                    fnd.boneData.Rotation = { rotationEuler.x, rotationEuler.y, rotationEuler.z };
+
+                    fullNodeDataList.push_back(fnd);
+
+                    for (int i = node->mNumChildren - 1; i >= 0; --i)
+                        stack.push_back(node->mChildren[i]);
+                }
+
+                std::cout << "\ntotal nodes (excluding dummy parents): " << totalNodeCount << "\n";
+                std::cout << "non-mesh nodes: " << nonMeshNodes.size() << "\n";
+
+                // add children indices to childrenIndexList in FullNodeData
+                for (size_t parentIdx = 0; parentIdx < allAiNodes.size(); ++parentIdx) {
+                    aiNode* parentNode = allAiNodes[parentIdx];
+                    for (unsigned int i = 0; i < parentNode->mNumChildren; ++i) {
+                        aiNode* child = parentNode->mChildren[i];
+
+                        // find the index of this child in allAiNodes
+                        auto it = std::find(allAiNodes.begin(), allAiNodes.end(), child);
+                        if (it != allAiNodes.end()) {
+                            size_t childIdx = std::distance(allAiNodes.begin(), it);
+                            fullNodeDataList[parentIdx].childrenIndexList.push_back(static_cast<uint32_t>(childIdx));
+                        }
+                    }
+                }
+
+                // pick root nodes out of all nodes by checking if they are not in any childIndices
+                std::vector<uint32_t> rootNodes;
+                std::unordered_set<uint32_t> childIndices;
+                for (const auto& fnd : fullNodeDataList) {
+                    for (auto childIdx : fnd.childrenIndexList)
+                        childIndices.insert(childIdx);
+                }
+                for (uint32_t i = 0; i < fullNodeDataList.size(); ++i) {
+                    if (childIndices.find(i) == childIndices.end()) {
+                        rootNodes.push_back(i);
+                    }
+                }
+
+                // debug print
+                //std::cout << "\nall nodes in order:\n"; for (const auto& node : allNodeNames) std::cout << "  " << node.Name << "\n";
+
+                // create allBoneNames vector with struct NodeNames, keeping DataOffset same as original nodes
+                std::vector<NodeNames> boneNames;
+                boneNames.reserve(nonMeshNodes.size());
+
+                // first find matching DataOffset from allNodeNames for each bone name
+                for (const auto& boneNameStr : nonMeshNodes) {
+                    auto it = std::find_if(allNodeNames.begin(), allNodeNames.end(), [&](const NodeNames& n) {
+                        return n.Name == boneNameStr;
+                        });
+                    boneNames.push_back({ it->DataOffset, it->Name, 0 });
+                }
+                // sort allBoneNames by Name alphabetically with capitals first
+                std::sort(boneNames.begin(), boneNames.end(), [](const NodeNames& a, const NodeNames& b) {
+                    size_t len = a.Name.size() < b.Name.size() ? a.Name.size() : b.Name.size();
+                    for (size_t i = 0; i < len; ++i) {
+                        unsigned char c1 = a.Name[i];
+                        unsigned char c2 = b.Name[i];
+                        if (c1 != c2) {
+                            if (std::isupper(c1) && std::islower(c2)) return true;
+                            if (std::islower(c1) && std::isupper(c2)) return false;
+                            return c1 < c2;
+                        }
+                    }
+                    return a.Name.size() < b.Name.size();
+                    });
+
+                // debug print the sorted bone names
+                //std::cout << "\nnon-mesh nodes (bones) sorted alphabetically (caps first):\n"; for (const auto& bone : allBoneNames) { std::cout << "  " << bone.Name << " (DataOffset " << bone.DataOffset << ")\n"; }
+
+                // assign more header stuffs
+                headerData.BoneCount = static_cast<uint32_t>(nonMeshNodes.size());
+                headerData.TotalNodeCount = static_cast<uint32_t>(totalNodeCount);
+
+                // turn material presets into materialsData list
+                std::vector<Material> materialsData;
+                materialsData.reserve(materials.size());
+                for (const auto& mat : materials) {
+                    Material m;
+                    m.Diffuse.assign(mat.diffuse, mat.diffuse + 4);
+                    m.Specular.assign(mat.specular, mat.specular + 4);
+                    m.Ambience.assign(mat.ambience, mat.ambience + 4);
+                    m.Shiny = mat.shiny;
+                    m.TextureIndices[0] = static_cast<int16_t>(mat.texAlbedo);
+                    m.TextureIndices[1] = static_cast<int16_t>(mat.texSpecular);
+                    m.TextureIndices[2] = static_cast<int16_t>(mat.texReflective);
+                    m.TextureIndices[3] = static_cast<int16_t>(mat.texEnvironment);
+                    m.TextureIndices[4] = static_cast<int16_t>(mat.texNormal);
+                    m.Unknowns[0] = mat.unknownVal; // will try find out about it another time
+                    m.Unknowns2[3] = mat.unknownVal2;
+                    materialsData.push_back(m);
+                }
+
+                std::vector<NodeLinks> nodeLinks;
+                uint32_t totalLinksCount = 0;
+
+                // create sorted index view
+                std::vector<size_t> sortedIndices(allAiNodes.size());
+                for (size_t i = 0; i < sortedIndices.size(); ++i)
+                    sortedIndices[i] = i;
+
+                // sort the indices based on allAiNodes names
+                for (size_t i = 0; i < sortedIndices.size(); ++i) {
+                    for (size_t j = i + 1; j < sortedIndices.size(); ++j) {
+                        if (strcmp(allAiNodes[sortedIndices[i]]->mName.C_Str(), allAiNodes[sortedIndices[j]]->mName.C_Str()) > 0)
+                            std::swap(sortedIndices[i], sortedIndices[j]);
+                    }
+                }
+
+                // fix material index on meshes (assimp loads in order of first used, not dae order)
+                auto meshMaterialMap = CallGetMaterialIndicesFromDLL(filePathInput);
+                for (unsigned int i = 0; i < scene->mNumMeshes; ++i) {
+                    aiMesh* mesh = scene->mMeshes[i];
+                    auto found = meshMaterialMap.find(mesh->mName.C_Str());
+                    if (found != meshMaterialMap.end()) {
+                        std::cout << "  overriding material index of mesh " << mesh->mName.C_Str() << " to " << found->second << "\n";
+                        scene->mMeshes[i]->mMaterialIndex = found->second;
+                    }
+                }
+
+                // loop in sorted order using the index indirection
+                for (size_t sortedIndex = 0; sortedIndex < sortedIndices.size(); ++sortedIndex) {
+                    size_t originalIndex = sortedIndices[sortedIndex];
+                    aiNode* node = allAiNodes[originalIndex];
+
+                    auto& fullNode = fullNodeDataList[originalIndex];
+                    // find uniqueBoneIndices from all bones in meshes of this node (order from daeBoneList will reorder them later)
+                    std::vector<uint32_t> uniqueBoneIndices;
+                    if (node->mNumMeshes > 0) {
+                        for (unsigned int meshIdx = 0; meshIdx < node->mNumMeshes; ++meshIdx) {
+                            aiMesh* mesh = scene->mMeshes[node->mMeshes[meshIdx]];
+                            for (unsigned int b = 0; b < mesh->mNumBones; ++b) {
+                                std::string boneName = mesh->mBones[b]->mName.C_Str();
+                                for (size_t boneIdx = 0; boneIdx < allAiNodes.size(); ++boneIdx) {
+                                    if (boneName == allAiNodes[boneIdx]->mName.C_Str()) {
+                                        if (std::find(uniqueBoneIndices.begin(), uniqueBoneIndices.end(), static_cast<uint32_t>(boneIdx)) == uniqueBoneIndices.end())
+                                            uniqueBoneIndices.push_back(static_cast<uint32_t>(boneIdx));
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+
+                        // get daeBoneList order for this node’s submeshes (concatenate all daeBoneLists for submeshes)
+                        std::vector<std::string> daeBoneListCombined;
+                        for (unsigned int meshIdx = 0; meshIdx < node->mNumMeshes; ++meshIdx) {
+                            uint32_t meshIndex = node->mMeshes[meshIdx];
+                            aiMesh* mesh = scene->mMeshes[meshIndex];
+                            auto daeBoneList = CallGetDaeBoneNamesFromDLL(filePathInput, mesh->mName.C_Str());
+
+                            daeBoneListCombined.insert(daeBoneListCombined.end(), daeBoneList.begin(), daeBoneList.end());
+                        }
+
+                        // reorder uniqueBoneIndices to follow order in daeBoneListCombined
+                        std::vector<uint32_t> reorderedUniqueBoneIndices;
+                        for (const auto& boneName : daeBoneListCombined) {
+                            for (auto it = uniqueBoneIndices.begin(); it != uniqueBoneIndices.end(); ++it) {
+                                if (allAiNodes[*it]->mName.C_Str() == boneName) {
+                                    reorderedUniqueBoneIndices.push_back(*it);
+                                    uniqueBoneIndices.erase(it);
                                     break;
                                 }
                             }
                         }
+                        uniqueBoneIndices = std::move(reorderedUniqueBoneIndices);
+
+                        // cap skinnedCount at 6 max or total bones count
+                        uint32_t skinnedCount = uniqueBoneIndices.size() > 6 ? 6 : static_cast<uint32_t>(uniqueBoneIndices.size());
+                        // build default mask: first skinnedCount bits set to 1, rest 0
+                        uint32_t defaultMask = (1u << skinnedCount) - 1;
+
+                        NodeLinks link;
+                        link.MeshOffset = originalIndex;
+                        link.BoneOffsets = uniqueBoneIndices;
+                        totalLinksCount += static_cast<uint32_t>(uniqueBoneIndices.size());
+
+                        fullNode.subMeshes.resize(node->mNumMeshes);
+                        for (size_t s = 0; s < fullNode.subMeshes.size(); ++s) {
+                            uint32_t meshIndex = node->mMeshes[s];
+                            aiMesh* mesh = scene->mMeshes[meshIndex];
+
+                            uint32_t mask = defaultMask;
+                            std::vector<uint32_t> availableDefaults;
+                            for (uint32_t i = 0; i < skinnedCount; ++i)
+                                availableDefaults.push_back(i);
+
+                            std::cout << "processing mesh: " << mesh->mName.C_Str() << "\n";
+
+                            for (unsigned int b = 0; b < mesh->mNumBones; ++b) {
+                                std::string boneName = mesh->mBones[b]->mName.C_Str();
+
+                                auto it = std::find_if(uniqueBoneIndices.begin(), uniqueBoneIndices.end(),
+                                    [&](uint32_t idx) { return allAiNodes[idx]->mName.C_Str() == boneName; });
+                                if (it == uniqueBoneIndices.end())
+                                    continue;
+
+                                uint32_t boneIdx = static_cast<uint32_t>(std::distance(uniqueBoneIndices.begin(), it));
+                                uint32_t bit = 1u << boneIdx;
+
+                                if (mask & bit) {
+                                    auto defIt = std::find(availableDefaults.begin(), availableDefaults.end(), boneIdx);
+                                    if (defIt != availableDefaults.end())
+                                        availableDefaults.erase(defIt);
+                                    continue;
+                                }
+
+                                if (!availableDefaults.empty()) {
+                                    uint32_t defaultBitIdx = availableDefaults.back();
+                                    availableDefaults.pop_back();
+
+                                    mask &= ~(1u << defaultBitIdx);
+                                    mask |= bit;
+                                }
+                            }
+
+                            //std::cout << "final mask bits: "; for (size_t i = 0; i < uniqueBoneIndices.size(); ++i) std::cout << ((mask & (1u << i)) ? '1' : '0') << "\n";
+
+                            fullNode.subMeshes[s].BonesIndexMask = mask;
+                            fullNode.subMeshes[s].SkinnedBonesCount = skinnedCount;
+                            fullNode.subMeshes[s].TriangleCount = mesh->mNumFaces;
+                            fullNode.subMeshes[s].MaterialIndex = mesh->mMaterialIndex + dummyMat;
+                            fullNode.subMeshes[s].VertexCount = mesh->mNumVertices;
+
+                            std::vector<float> verts, norms, cols, uv0, uv1, uv2, uv3;
+                            std::vector<uint16_t> indices;
+
+                            for (unsigned int v = 0; v < mesh->mNumVertices; ++v) {
+                                verts.push_back(mesh->mVertices[v].x);
+                                verts.push_back(mesh->mVertices[v].y);
+                                verts.push_back(mesh->mVertices[v].z);
+                            }
+                            fullNode.subMeshes[s].VertexPositionOffset = 1;
+
+                            if (mesh->HasNormals()) {
+                                for (unsigned int v = 0; v < mesh->mNumVertices; ++v) {
+                                    norms.push_back(mesh->mNormals[v].x);
+                                    norms.push_back(mesh->mNormals[v].y);
+                                    norms.push_back(mesh->mNormals[v].z);
+                                }
+                                fullNode.subMeshes[s].VertexNormalOffset = 1;
+                            }
+
+                            // if vertex colouring is just all 1, 1, 1, 1 skip it
+                            bool allWhite = true;
+                            if (mesh->HasVertexColors(0) && mesh->mColors[0]) {
+                                for (unsigned int v = 0; v < mesh->mNumVertices; ++v) {
+                                    auto& c = mesh->mColors[0][v];
+                                    if (c.r != 1.f || c.g != 1.f || c.b != 1.f || c.a != 1.f) {
+                                        allWhite = false;
+                                        break;
+                                    }
+                                }
+                            }
+                            else {
+                                allWhite = false; // or true depending on what you wanna assume if there's no color data
+                            }
+                            if (!allWhite && mesh->HasVertexColors(0) && mesh->mColors[0]) {
+                                for (unsigned int v = 0; v < mesh->mNumVertices; ++v) {
+                                    cols.push_back(mesh->mColors[0][v].r);
+                                    cols.push_back(mesh->mColors[0][v].g);
+                                    cols.push_back(mesh->mColors[0][v].b);
+                                    cols.push_back(mesh->mColors[0][v].a);
+                                }
+                                fullNode.subMeshes[s].ColorBufferOffset = 1;
+                            }
+                            else {
+                                fullNode.subMeshes[s].ColorBufferOffset = 0;
+                            }
+
+                            if (mesh->HasTextureCoords(0)) {
+                                for (unsigned int v = 0; v < mesh->mNumVertices; ++v) {
+                                    uv0.push_back(mesh->mTextureCoords[0][v].x);
+                                    uv0.push_back(mesh->mTextureCoords[0][v].y);
+                                }
+                                fullNode.subMeshes[s].TexCoord0Offset = 1;
+                            }
+                            if (mesh->HasTextureCoords(1)) {
+                                for (unsigned int v = 0; v < mesh->mNumVertices; ++v) {
+                                    uv1.push_back(mesh->mTextureCoords[1][v].x);
+                                    uv1.push_back(mesh->mTextureCoords[1][v].y);
+                                }
+                                fullNode.subMeshes[s].TexCoord1Offset = 1;
+                            }
+                            if (mesh->HasTextureCoords(2)) {
+                                for (unsigned int v = 0; v < mesh->mNumVertices; ++v) {
+                                    uv2.push_back(mesh->mTextureCoords[2][v].x);
+                                    uv2.push_back(mesh->mTextureCoords[2][v].y);
+                                }
+                                fullNode.subMeshes[s].TexCoord2Offset = 1;
+                            }
+                            if (mesh->HasTextureCoords(3)) {
+                                for (unsigned int v = 0; v < mesh->mNumVertices; ++v) {
+                                    uv3.push_back(mesh->mTextureCoords[3][v].x);
+                                    uv3.push_back(mesh->mTextureCoords[3][v].y);
+                                }
+                                fullNode.subMeshes[s].TexCoord3Offset = 1;
+                            }
+
+                            for (unsigned int f = 0; f < mesh->mNumFaces; ++f) {
+                                const aiFace& face = mesh->mFaces[f];
+                                for (unsigned int i = 0; i < face.mNumIndices; ++i)
+                                    indices.push_back(static_cast<uint16_t>(face.mIndices[i]));
+                            }
+                            fullNode.subMeshes[s].FaceOffset = 1;
+
+                            // write all weights for this submesh
+                            std::vector<float> weightsForThisMesh;
+                            for (size_t i = 0; i < uniqueBoneIndices.size(); ++i) {
+                                if (!(mask & (1u << i))) continue;
+
+                                uint32_t boneNodeIndex = uniqueBoneIndices[i];
+                                const char* targetBoneName = allAiNodes[boneNodeIndex]->mName.C_Str();
+
+                                aiBone* aiBonePtr = nullptr;
+                                for (unsigned int b = 0; b < mesh->mNumBones; ++b) {
+                                    if (std::strcmp(mesh->mBones[b]->mName.C_Str(), targetBoneName) == 0) {
+                                        aiBonePtr = mesh->mBones[b];
+                                        break;
+                                    }
+                                }
+
+                                if (!aiBonePtr) {
+                                    weightsForThisMesh.insert(weightsForThisMesh.end(), mesh->mNumVertices, 0.0f);
+                                    continue;
+                                }
+
+                                std::vector<float> boneWeights(mesh->mNumVertices, 0.0f);
+                                for (unsigned int w = 0; w < aiBonePtr->mNumWeights; ++w) {
+                                    unsigned int vertexId = aiBonePtr->mWeights[w].mVertexId;
+                                    if (vertexId < mesh->mNumVertices)
+                                        boneWeights[vertexId] = aiBonePtr->mWeights[w].mWeight;
+                                }
+                                weightsForThisMesh.insert(weightsForThisMesh.end(), boneWeights.begin(), boneWeights.end());
+                            }
+
+                            fullNode.subMeshes[s].WeightOffset = weightsForThisMesh.empty() ? 0 : 1;
+                            fullNode.weightsList.push_back(std::move(weightsForThisMesh));
+
+                            // bounding box calc
+                            aiMatrix4x4 nodeTransform = node->mTransformation;
+                            aiNode* current = node->mParent;
+                            while (current) {
+                                nodeTransform = current->mTransformation * nodeTransform;
+                                current = current->mParent;
+                            }
+
+                            std::vector<aiVector3D> worldVerts;
+                            for (size_t v = 0; v < verts.size(); v += 3) {
+                                aiVector3D worldPos(verts[v], verts[v + 1], verts[v + 2]);
+                                worldPos *= nodeTransform;
+                                worldVerts.push_back(worldPos);
+                            }
+
+                            float maxX = -FLT_MAX, maxY = -FLT_MAX, maxZ = -FLT_MAX;
+                            float minX = FLT_MAX, minY = FLT_MAX, minZ = FLT_MAX;
+                            for (const auto& v : worldVerts) {
+                                if (v.x > maxX) maxX = v.x;
+                                if (v.y > maxY) maxY = v.y;
+                                if (v.z > maxZ) maxZ = v.z;
+                                if (v.x < minX) minX = v.x;
+                                if (v.y < minY) minY = v.y;
+                                if (v.z < minZ) minZ = v.z;
+                            }
+                            fullNode.subMeshes[s].BoundingBoxMaxMin[0] = maxX;
+                            fullNode.subMeshes[s].BoundingBoxMaxMin[1] = maxY;
+                            fullNode.subMeshes[s].BoundingBoxMaxMin[2] = maxZ;
+                            fullNode.subMeshes[s].BoundingBoxMaxMin[3] = minX;
+                            fullNode.subMeshes[s].BoundingBoxMaxMin[4] = minY;
+                            fullNode.subMeshes[s].BoundingBoxMaxMin[5] = minZ;
+
+                            aiVector3D center(0, 0, 0);
+                            for (const auto& v : worldVerts) center += v;
+                            center /= (float)worldVerts.size();
+
+                            float radius = 0.0f;
+                            for (const auto& v : worldVerts) {
+                                float distSq = (v - center).SquareLength();
+                                if (distSq > radius) radius = distSq;
+                            }
+                            radius = std::sqrt(radius);
+
+                            fullNode.subMeshes[s].BoundingBox[0] = center.x;
+                            fullNode.subMeshes[s].BoundingBox[1] = center.y;
+                            fullNode.subMeshes[s].BoundingBox[2] = center.z;
+                            fullNode.subMeshes[s].BoundingBox[3] = radius;
+
+                            fullNode.verticesList.push_back(std::move(verts));
+                            fullNode.normalsList.push_back(std::move(norms));
+                            fullNode.colorsList.push_back(std::move(cols));
+                            fullNode.uvs0List.push_back(std::move(uv0));
+                            fullNode.uvs1List.push_back(std::move(uv1));
+                            fullNode.uvs2List.push_back(std::move(uv2));
+                            fullNode.uvs3List.push_back(std::move(uv3));
+                            fullNode.polygonsList.push_back(std::move(indices));
+                        }
+                        nodeLinks.push_back(link);
                     }
 
-                    // get daeBoneList order for this node’s submeshes (concatenate all daeBoneLists for submeshes)
-                    std::vector<std::string> daeBoneListCombined;
-                    for (unsigned int meshIdx = 0; meshIdx < node->mNumMeshes; ++meshIdx) {
-                        uint32_t meshIndex = node->mMeshes[meshIdx];
-                        aiMesh* mesh = scene->mMeshes[meshIndex];
-                        auto daeBoneList = CallGetDaeBoneNamesFromDLL(filePathInput, mesh->mName.C_Str());
+                    // write 'animfloatmap' stuff from the txt preset
+                    for (std::map<std::string, std::array<float, 6>>::const_iterator it = animFloatMap.begin(); it != animFloatMap.end(); ++it) {
+                        const std::string& boneName = it->first;
+                        const std::array<float, 6>& vals = it->second;
 
-                        daeBoneListCombined.insert(daeBoneListCombined.end(), daeBoneList.begin(), daeBoneList.end());
-                    }
-
-                    // reorder uniqueBoneIndices to follow order in daeBoneListCombined
-                    std::vector<uint32_t> reorderedUniqueBoneIndices;
-                    for (const auto& boneName : daeBoneListCombined) {
-                        for (auto it = uniqueBoneIndices.begin(); it != uniqueBoneIndices.end(); ++it) {
-                            if (allAiNodes[*it]->mName.C_Str() == boneName) {
-                                reorderedUniqueBoneIndices.push_back(*it);
-                                uniqueBoneIndices.erase(it);
+                        for (size_t i = 0; i < allNodeNames.size(); ++i) {
+                            if (allNodeNames[i].Name == boneName) {
+                                for (int j = 0; j < 6; ++j)
+                                    fullNodeDataList[i].boneData.AnimationVals[j] = vals[j];
                                 break;
                             }
                         }
                     }
-                    uniqueBoneIndices = std::move(reorderedUniqueBoneIndices);
 
-                    // cap skinnedCount at 6 max or total bones count
-                    uint32_t skinnedCount = uniqueBoneIndices.size() > 6 ? 6 : static_cast<uint32_t>(uniqueBoneIndices.size());
-                    // build default mask: first skinnedCount bits set to 1, rest 0
-                    uint32_t defaultMask = (1u << skinnedCount) - 1;
+                    // get global bounding box for this node
+                    std::vector<aiVector3D> allWorldVerts;
+                    collectWorldVerts(node, scene, aiMatrix4x4(), allWorldVerts);
 
-                    NodeLinks link;
-                    link.MeshOffset = originalIndex;
-                    link.BoneOffsets = uniqueBoneIndices;
-                    totalLinksCount += static_cast<uint32_t>(uniqueBoneIndices.size());
+                    if (!allWorldVerts.empty()) {
+                        aiVector3D center(0, 0, 0);
+                        for (const auto& v : allWorldVerts) center += v;
+                        center /= (float)allWorldVerts.size();
 
-                    fullNode.subMeshes.resize(node->mNumMeshes);
-                    for (size_t s = 0; s < fullNode.subMeshes.size(); ++s) {
-                        uint32_t meshIndex = node->mMeshes[s];
-                        aiMesh* mesh = scene->mMeshes[meshIndex];
-
-                        uint32_t mask = defaultMask;
-                        std::vector<uint32_t> availableDefaults;
-                        for (uint32_t i = 0; i < skinnedCount; ++i)
-                            availableDefaults.push_back(i);
-
-                        std::cout << "processing mesh: " << mesh->mName.C_Str() << "\n";
-
-                        for (unsigned int b = 0; b < mesh->mNumBones; ++b) {
-                            std::string boneName = mesh->mBones[b]->mName.C_Str();
-
-                            auto it = std::find_if(uniqueBoneIndices.begin(), uniqueBoneIndices.end(),
-                                [&](uint32_t idx) { return allAiNodes[idx]->mName.C_Str() == boneName; });
-                            if (it == uniqueBoneIndices.end())
-                                continue;
-
-                            uint32_t boneIdx = static_cast<uint32_t>(std::distance(uniqueBoneIndices.begin(), it));
-                            uint32_t bit = 1u << boneIdx;
-
-                            if (mask & bit) {
-                                auto defIt = std::find(availableDefaults.begin(), availableDefaults.end(), boneIdx);
-                                if (defIt != availableDefaults.end())
-                                    availableDefaults.erase(defIt);
-                                continue;
-                            }
-
-                            if (!availableDefaults.empty()) {
-                                uint32_t defaultBitIdx = availableDefaults.back();
-                                availableDefaults.pop_back();
-
-                                mask &= ~(1u << defaultBitIdx);
-                                mask |= bit;
-                            }
+                        float radius = 0.0f;
+                        for (const auto& v : allWorldVerts) {
+                            float distSq = (v - center).SquareLength();
+                            if (distSq > radius) radius = distSq;
                         }
+                        radius = std::sqrt(radius);
 
-                        //std::cout << "final mask bits: "; for (size_t i = 0; i < uniqueBoneIndices.size(); ++i) std::cout << ((mask & (1u << i)) ? '1' : '0') << "\n";
+                        fullNode.boneData.BoundingBox[0] = center.x;
+                        fullNode.boneData.BoundingBox[1] = center.y;
+                        fullNode.boneData.BoundingBox[2] = center.z;
+                        fullNode.boneData.BoundingBox[3] = radius;
 
-                        fullNode.subMeshes[s].BonesIndexMask = mask;
-                        fullNode.subMeshes[s].SkinnedBonesCount = skinnedCount;
-                        fullNode.subMeshes[s].TriangleCount = mesh->mNumFaces;
-                        fullNode.subMeshes[s].MaterialIndex = mesh->mMaterialIndex + dummyMat;
-                        fullNode.subMeshes[s].VertexCount = mesh->mNumVertices;
-
-                        std::vector<float> verts, norms, cols, uv0, uv1, uv2, uv3;
-                        std::vector<uint16_t> indices;
-
-                        for (unsigned int v = 0; v < mesh->mNumVertices; ++v) {
-                            verts.push_back(mesh->mVertices[v].x);
-                            verts.push_back(mesh->mVertices[v].y);
-                            verts.push_back(mesh->mVertices[v].z);
-                        }
-                        fullNode.subMeshes[s].VertexPositionOffset = 1;
-
-                        if (mesh->HasNormals()) {
-                            for (unsigned int v = 0; v < mesh->mNumVertices; ++v) {
-                                norms.push_back(mesh->mNormals[v].x);
-                                norms.push_back(mesh->mNormals[v].y);
-                                norms.push_back(mesh->mNormals[v].z);
-                            }
-                            fullNode.subMeshes[s].VertexNormalOffset = 1;
-                        }
-
-                        // if vertex colouring is just all 1, 1, 1, 1 skip it
-                        bool allWhite = true;
-                        if (mesh->HasVertexColors(0) && mesh->mColors[0]) {
-                            for (unsigned int v = 0; v < mesh->mNumVertices; ++v) {
-                                auto& c = mesh->mColors[0][v];
-                                if (c.r != 1.f || c.g != 1.f || c.b != 1.f || c.a != 1.f) {
-                                    allWhite = false;
-                                    break;
-                                }
-                            }
-                        }
-                        else {
-                            allWhite = false; // or true depending on what you wanna assume if there's no color data
-                        }
-                        if (!allWhite && mesh->HasVertexColors(0) && mesh->mColors[0]) {
-                            for (unsigned int v = 0; v < mesh->mNumVertices; ++v) {
-                                cols.push_back(mesh->mColors[0][v].r);
-                                cols.push_back(mesh->mColors[0][v].g);
-                                cols.push_back(mesh->mColors[0][v].b);
-                                cols.push_back(mesh->mColors[0][v].a);
-                            }
-                            fullNode.subMeshes[s].ColorBufferOffset = 1;
-                        }
-                        else {
-                            fullNode.subMeshes[s].ColorBufferOffset = 0;
-                        }
-
-                        if (mesh->HasTextureCoords(0)) {
-                            for (unsigned int v = 0; v < mesh->mNumVertices; ++v) {
-                                uv0.push_back(mesh->mTextureCoords[0][v].x);
-                                uv0.push_back(mesh->mTextureCoords[0][v].y);
-                            }
-                            fullNode.subMeshes[s].TexCoord0Offset = 1;
-                        }
-                        if (mesh->HasTextureCoords(1)) {
-                            for (unsigned int v = 0; v < mesh->mNumVertices; ++v) {
-                                uv1.push_back(mesh->mTextureCoords[1][v].x);
-                                uv1.push_back(mesh->mTextureCoords[1][v].y);
-                            }
-                            fullNode.subMeshes[s].TexCoord1Offset = 1;
-                        }
-                        if (mesh->HasTextureCoords(2)) {
-                            for (unsigned int v = 0; v < mesh->mNumVertices; ++v) {
-                                uv2.push_back(mesh->mTextureCoords[2][v].x);
-                                uv2.push_back(mesh->mTextureCoords[2][v].y);
-                            }
-                            fullNode.subMeshes[s].TexCoord2Offset = 1;
-                        }
-                        if (mesh->HasTextureCoords(3)) {
-                            for (unsigned int v = 0; v < mesh->mNumVertices; ++v) {
-                                uv3.push_back(mesh->mTextureCoords[3][v].x);
-                                uv3.push_back(mesh->mTextureCoords[3][v].y);
-                            }
-                            fullNode.subMeshes[s].TexCoord3Offset = 1;
-                        }
-
-                        for (unsigned int f = 0; f < mesh->mNumFaces; ++f) {
-                            const aiFace& face = mesh->mFaces[f];
-                            for (unsigned int i = 0; i < face.mNumIndices; ++i)
-                                indices.push_back(static_cast<uint16_t>(face.mIndices[i]));
-                        }
-                        fullNode.subMeshes[s].FaceOffset = 1;
-
-                        // write all weights for this submesh
-                        std::vector<float> weightsForThisMesh;
-                        for (size_t i = 0; i < uniqueBoneIndices.size(); ++i) {
-                            if (!(mask & (1u << i))) continue;
-
-                            uint32_t boneNodeIndex = uniqueBoneIndices[i];
-                            const char* targetBoneName = allAiNodes[boneNodeIndex]->mName.C_Str();
-
-                            aiBone* aiBonePtr = nullptr;
-                            for (unsigned int b = 0; b < mesh->mNumBones; ++b) {
-                                if (std::strcmp(mesh->mBones[b]->mName.C_Str(), targetBoneName) == 0) {
-                                    aiBonePtr = mesh->mBones[b];
-                                    break;
-                                }
-                            }
-
-                            if (!aiBonePtr) {
-                                weightsForThisMesh.insert(weightsForThisMesh.end(), mesh->mNumVertices, 0.0f);
-                                continue;
-                            }
-
-                            std::vector<float> boneWeights(mesh->mNumVertices, 0.0f);
-                            for (unsigned int w = 0; w < aiBonePtr->mNumWeights; ++w) {
-                                unsigned int vertexId = aiBonePtr->mWeights[w].mVertexId;
-                                if (vertexId < mesh->mNumVertices)
-                                    boneWeights[vertexId] = aiBonePtr->mWeights[w].mWeight;
-                            }
-                            weightsForThisMesh.insert(weightsForThisMesh.end(), boneWeights.begin(), boneWeights.end());
-                        }
-
-                        fullNode.subMeshes[s].WeightOffset = weightsForThisMesh.empty() ? 0 : 1;
-                        fullNode.weightsList.push_back(std::move(weightsForThisMesh));
-
-                        // bounding box calc
-                        aiMatrix4x4 nodeTransform = node->mTransformation;
-                        aiNode* current = node->mParent;
-                        while (current) {
-                            nodeTransform = current->mTransformation * nodeTransform;
-                            current = current->mParent;
-                        }
-
-                        std::vector<aiVector3D> worldVerts;
-                        for (size_t v = 0; v < verts.size(); v += 3) {
-                            aiVector3D worldPos(verts[v], verts[v + 1], verts[v + 2]);
-                            worldPos *= nodeTransform;
-                            worldVerts.push_back(worldPos);
-                        }
+                        //printf("full world center (node + children): %f %f %f\n", center.x, center.y, center.z);
+                        //printf("full world radius (node + children): %f\n", radius);
 
                         float maxX = -FLT_MAX, maxY = -FLT_MAX, maxZ = -FLT_MAX;
                         float minX = FLT_MAX, minY = FLT_MAX, minZ = FLT_MAX;
-                        for (const auto& v : worldVerts) {
+
+                        for (const auto& v : allWorldVerts) {
                             if (v.x > maxX) maxX = v.x;
                             if (v.y > maxY) maxY = v.y;
                             if (v.z > maxZ) maxZ = v.z;
@@ -1453,126 +1595,106 @@ int main(int argc, char* argv[])
                             if (v.y < minY) minY = v.y;
                             if (v.z < minZ) minZ = v.z;
                         }
-                        fullNode.subMeshes[s].BoundingBoxMaxMin[0] = maxX;
-                        fullNode.subMeshes[s].BoundingBoxMaxMin[1] = maxY;
-                        fullNode.subMeshes[s].BoundingBoxMaxMin[2] = maxZ;
-                        fullNode.subMeshes[s].BoundingBoxMaxMin[3] = minX;
-                        fullNode.subMeshes[s].BoundingBoxMaxMin[4] = minY;
-                        fullNode.subMeshes[s].BoundingBoxMaxMin[5] = minZ;
 
-                        aiVector3D center(0, 0, 0);
-                        for (const auto& v : worldVerts) center += v;
-                        center /= (float)worldVerts.size();
-
-                        float radius = 0.0f;
-                        for (const auto& v : worldVerts) {
-                            float distSq = (v - center).SquareLength();
-                            if (distSq > radius) radius = distSq;
-                        }
-                        radius = std::sqrt(radius);
-
-                        fullNode.subMeshes[s].BoundingBox[0] = center.x;
-                        fullNode.subMeshes[s].BoundingBox[1] = center.y;
-                        fullNode.subMeshes[s].BoundingBox[2] = center.z;
-                        fullNode.subMeshes[s].BoundingBox[3] = radius;
-
-                        fullNode.verticesList.push_back(std::move(verts));
-                        fullNode.normalsList.push_back(std::move(norms));
-                        fullNode.colorsList.push_back(std::move(cols));
-                        fullNode.uvs0List.push_back(std::move(uv0));
-                        fullNode.uvs1List.push_back(std::move(uv1));
-                        fullNode.uvs2List.push_back(std::move(uv2));
-                        fullNode.uvs3List.push_back(std::move(uv3));
-                        fullNode.polygonsList.push_back(std::move(indices));
+                        fullNode.boneData.BoundingBoxMaxMin[0] = maxX;
+                        fullNode.boneData.BoundingBoxMaxMin[1] = maxY;
+                        fullNode.boneData.BoundingBoxMaxMin[2] = maxZ;
+                        fullNode.boneData.BoundingBoxMaxMin[3] = minX;
+                        fullNode.boneData.BoundingBoxMaxMin[4] = minY;
+                        fullNode.boneData.BoundingBoxMaxMin[5] = minZ;
                     }
-                    nodeLinks.push_back(link);
-                }
-
-                // write 'animfloatmap' stuff from the txt preset
-                for (std::map<std::string, std::array<float, 6>>::const_iterator it = animFloatMap.begin(); it != animFloatMap.end(); ++it) {
-                    const std::string& boneName = it->first;
-                    const std::array<float, 6>& vals = it->second;
-
-                    for (size_t i = 0; i < allNodeNames.size(); ++i) {
-                        if (allNodeNames[i].Name == boneName) {
-                            for (int j = 0; j < 6; ++j)
-                                fullNodeDataList[i].boneData.AnimationVals[j] = vals[j];
-                            break;
-                        }
-                    }
-                }
-
-				// get global bounding box for this node
-                std::vector<aiVector3D> allWorldVerts;
-                collectWorldVerts(node, scene, aiMatrix4x4(), allWorldVerts);
-
-                if (!allWorldVerts.empty()) {
-                    aiVector3D center(0, 0, 0);
-                    for (const auto& v : allWorldVerts) center += v;
-                    center /= (float)allWorldVerts.size();
-
-                    float radius = 0.0f;
-                    for (const auto& v : allWorldVerts) {
-                        float distSq = (v - center).SquareLength();
-                        if (distSq > radius) radius = distSq;
-                    }
-                    radius = std::sqrt(radius);
-
-                    fullNode.boneData.BoundingBox[0] = center.x;
-                    fullNode.boneData.BoundingBox[1] = center.y;
-                    fullNode.boneData.BoundingBox[2] = center.z;
-                    fullNode.boneData.BoundingBox[3] = radius;
-
-                    //printf("full world center (node + children): %f %f %f\n", center.x, center.y, center.z);
-                    //printf("full world radius (node + children): %f\n", radius);
-
-                    float maxX = -FLT_MAX, maxY = -FLT_MAX, maxZ = -FLT_MAX;
-                    float minX = FLT_MAX, minY = FLT_MAX, minZ = FLT_MAX;
-
-                    for (const auto& v : allWorldVerts) {
-                        if (v.x > maxX) maxX = v.x;
-                        if (v.y > maxY) maxY = v.y;
-                        if (v.z > maxZ) maxZ = v.z;
-                        if (v.x < minX) minX = v.x;
-                        if (v.y < minY) minY = v.y;
-                        if (v.z < minZ) minZ = v.z;
+                    else {
+                        fullNode.boneData.BoundingBox[0] = 0.f;
+                        fullNode.boneData.BoundingBox[1] = 0.f;
+                        fullNode.boneData.BoundingBox[2] = 0.f;
+                        fullNode.boneData.BoundingBox[3] = 0.f;
+                        //printf("no vertices found in node subtree\n");
                     }
 
-                    fullNode.boneData.BoundingBoxMaxMin[0] = maxX;
-                    fullNode.boneData.BoundingBoxMaxMin[1] = maxY;
-                    fullNode.boneData.BoundingBoxMaxMin[2] = maxZ;
-                    fullNode.boneData.BoundingBoxMaxMin[3] = minX;
-                    fullNode.boneData.BoundingBoxMaxMin[4] = minY;
-                    fullNode.boneData.BoundingBoxMaxMin[5] = minZ;
-                }
-                else {
-                    fullNode.boneData.BoundingBox[0] = 0.f;
-                    fullNode.boneData.BoundingBox[1] = 0.f;
-                    fullNode.boneData.BoundingBox[2] = 0.f;
-                    fullNode.boneData.BoundingBox[3] = 0.f;
-                    //printf("no vertices found in node subtree\n");
+                    //std::cout << "node " << sortedIndex << " (" << node->mName.C_Str() << ") bones: ";
+                    //for (auto b : uniqueBoneIndices) std::cout << b << " " << "\n";
                 }
 
-                //std::cout << "node " << sortedIndex << " (" << node->mName.C_Str() << ") bones: ";
-                //for (auto b : uniqueBoneIndices) std::cout << b << " " << "\n";
+                // set total links count in header
+                headerData.LinkNodeCount = totalLinksCount;
+
+                check.close();
+
+                //std::cout << outDir << " is the output directory\n";
+                SaveMKDXFile(filePathInput, outDir, headerData, materialsData, textureNames, boneNames, nodeLinks, allNodeNames, rootNodes, fullNodeDataList);
+                std::remove(filePathInput.c_str()); // remove tmp file
             }
-
-            // set total links count in header
-            headerData.LinkNodeCount = totalLinksCount;
-
-            check.close();
-
-			//std::cout << outDir << " is the output directory\n";
-            SaveMKDXFile(filePathInput, outDir, headerData, materialsData, textureNames, boneNames, nodeLinks, allNodeNames, rootNodes, fullNodeDataList);
-            std::remove(filePathInput.c_str()); // remove tmp file
         }
-	}
-    else {
-	    std::cerr << "eyyooo mai bruther, '" << ext << "' this file idk wtf are this welcome to the thanos world\n";
-		std::ofstream(logPath.c_str(), std::ios::trunc) << "Error: unsupported file extension '" + ext + "'";
-	    //system("pause");
-	    return 1;
-	}
+        else {
+            std::cerr << "eyyooo mai bruther, '" << ext << "' this file idk wtf are this welcome to the thanos world\n";
+            std::ofstream(logPath.c_str(), std::ios::trunc) << "Error: unsupported file extension '" + ext + "'";
+            //system("pause");
+            return 1;
+        }
+    }
+    else if (isDir)
+    {
+        // FIRE LOGO PRINT
+        FireLogoPrint(56);
+        // IF INPUT IS DIRECTORY
+        std::string path = filePathInput;
+        if (!path.empty() && (path.back() == '/' || path.back() == '\\'))
+            path.pop_back();
+        size_t lastSlash = path.find_last_of("/\\");
+        std::string folderName = (lastSlash != std::string::npos) ? path.substr(lastSlash + 1) : path;
+        outDir = outDir + "\\" + folderName + "\\";
+        CreateDirectoryA(outDir.c_str(), NULL);
+
+        std::string searchPath = filePathInput + "\\*";
+        WIN32_FIND_DATAA ffd;
+        HANDLE hFind = FindFirstFileA(searchPath.c_str(), &ffd);
+        if (hFind != INVALID_HANDLE_VALUE)
+        {
+            int converted = 0;
+            int skipped = 0;
+            do
+            {
+                std::string fName = ffd.cFileName;
+                if (fName != "." && fName != "..")
+                {
+                    std::string fullPath = filePathInput + "\\" + fName;
+                    if (fullPath.size() >= 4 && fullPath.substr(fullPath.size() - 4) == ".bin")
+                    {
+                        std::ifstream fs(fullPath, std::ios::binary);
+                        if (fs) {
+                            try {
+                                MKDXData data = LoadMKDXFile(fs);
+                                SaveDaeFile(fullPath, outDir, data.headerData, data.materialsData, data.textureNames,
+                                    data.nodeLinks, data.allNodeNames, data.rootNodes, data.fullNodeDataList, mergeOn);
+                                converted++;
+                            }
+                            catch (const std::exception& e) {
+                                numBinFilesWithErrors++;
+                            }
+                            catch (...) {
+                                numBinFilesWithErrors++;
+                            }
+                        }
+                        else skipped++;
+                    }
+                    else skipped++;
+                }
+            } while (FindNextFileA(hFind, &ffd) != 0);
+            FindClose(hFind);
+
+            std::ofstream(logPath.c_str(), std::ios::trunc)
+                << "Results: Exported contents of folder to " << outDir << "\n"
+                << converted << " file(s) converted\n"
+                << skipped << " file(s) skipped\n"
+                << numBinFilesWithErrors << " BIN file(s) with errors skipped";
+        }
+    }
+    else
+    {
+        std::cerr << "Input path is not valid: " << filePathInput << "\n";
+        std::ofstream(logPath.c_str(), std::ios::trunc) << "Error: input path is not valid";
+        return 1;
+    }
 
     //system("pause");
     return 0;

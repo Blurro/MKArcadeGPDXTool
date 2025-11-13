@@ -843,12 +843,19 @@ void SaveDaeFile(const std::string& path, const std::string& outDir, Header& hea
     }
 
     std::cout << std::endl << "Writing preset..." << std::endl;
-
+    // convoluted preset name script lol
     std::string presetFilename = path.substr(path.find_last_of("/\\") + 1);
     presetFilename = presetFilename.substr(0, presetFilename.find_last_of('.') == std::string::npos ? presetFilename.size() : presetFilename.find_last_of('.'));
-    presetFilename = presetFilename.substr(0, presetFilename.find('_') == std::string::npos ? presetFilename.size() : presetFilename.find('_'));
-    if (!presetFilename.empty()) presetFilename[0] = (char)toupper(presetFilename[0]);
-    std::string presetPath = MakeOutFilePath(presetFilename + "Preset.txt", outDir);
+    presetFilename = presetFilename.substr(0, presetFilename.find_first_of(' ') == std::string::npos ? presetFilename.size() : presetFilename.find_first_of(' '));
+    std::string result;
+    bool capitalize = true;
+    for (char c : presetFilename) {
+        if (c == '_' || c == '-') { capitalize = true; continue; }
+        result += capitalize ? (char)toupper(c) : c;
+        capitalize = false;
+    }
+    if (result.size() >= 5 && result.substr(result.size() - 5) == "Model") result = result.substr(0, result.size() - 5);
+    std::string presetPath = MakeOutFilePath(result + "_Preset.txt", outDir);
     WritePresetFile(presetPath, materialsData, textureNames, allNodeNames, fullNodeDataList);
 
     std::cout << std::endl << "Writing collada .dae..." << std::endl;
