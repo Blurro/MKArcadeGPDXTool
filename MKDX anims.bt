@@ -1,0 +1,122 @@
+LittleEndian();
+struct Header {
+    char signature[4];               // "BIKE"
+    ushort type;
+    ushort unknown;
+
+    uint alignment;
+    uint padding;
+
+    float FrameOneIndexMaybe;
+    float FrameLastIndex;
+    float FirstAnimOffsetmaybeOrFramerate;
+    
+    uint BoneCount;    
+    uint BoneDataPointers;
+    
+    uint zeros[3];
+} header;
+
+// cool structs that get name of thing and pointer under it
+typedef struct {
+    uint pointer;
+} cstring<read=ReadCString>;
+string ReadCString(cstring& str) {
+    if (str.pointer > 0) return ReadString(str.pointer);
+    return "(null)";
+}
+
+typedef struct
+{
+    cstring Name;
+    uint DataOffset;
+} Boneys;
+
+typedef struct
+{
+    float BaseScale[3];
+    float BaseRotate[3];
+    float BaseTranslate[3];
+    uint AnimScaleX;
+    uint AnimScaleY;
+    uint AnimScaleZ;
+    uint AnimRotateX;
+    uint AnimRotateY;
+    uint AnimRotateZ;
+    uint AnimTranslateX;
+    uint AnimTranslateY;
+    uint AnimTranslateZ;
+} BoneDats;
+
+typedef struct
+{
+    float index;
+    float value;
+} Framey;
+
+typedef struct
+{
+    uint FrameOne; 
+    uint FrameLast;
+    uint AnimOffset;
+    // frames always immediately follow anyway
+    FSeek(AnimOffset);
+    Framey Frame[FrameLast];
+} AnimDats;
+
+FSeek(header.BoneDataPointers);
+Boneys AllNames[header.BoneCount];
+
+local int i;
+local uint anim1, anim2, anim3, anim4, anim5, anim6, anim7, anim8, anim9;
+for (i = 0; i < header.BoneCount; i++) {
+    FSeek(header.BoneDataPointers + i*8);
+    cstring ____Name____;
+    FSeek(AllNames[i].DataOffset);
+    BoneDats NodeData;
+    anim1 = NodeData.AnimScaleX;
+    anim2 = NodeData.AnimScaleY;
+    anim3 = NodeData.AnimScaleZ;
+    anim4 = NodeData.AnimRotateX;
+    anim5 = NodeData.AnimRotateY;
+    anim6 = NodeData.AnimRotateZ;
+    anim7 = NodeData.AnimTranslateX;
+    anim8 = NodeData.AnimTranslateY;
+    anim9 = NodeData.AnimTranslateZ;
+    if (anim1 > 0) {
+        FSeek(anim1);
+        AnimDats AnimScaleX;
+    }
+    if (anim2 > 0) {
+        FSeek(anim2);
+        AnimDats AnimScaleY;
+    }
+    if (anim3 > 0) {
+        FSeek(anim3);
+        AnimDats AnimScaleZ;
+    }
+    if (anim4 > 0) {
+        FSeek(anim4);
+        AnimDats AnimRotateX;
+    }
+    if (anim5 > 0) {
+        FSeek(anim5);
+        AnimDats AnimRotateY;
+    }
+    if (anim6 > 0) {
+        FSeek(anim6);
+        AnimDats AnimRotateZ;
+    }
+    if (anim7 > 0) {
+        FSeek(anim7);
+        AnimDats AnimTranslateX;
+    }
+    if (anim8 > 0) {
+        FSeek(anim8);
+        AnimDats AnimTranslateY;
+    }
+    if (anim9 > 0) {
+        FSeek(anim9);
+        AnimDats AnimTranslateZ;
+    }
+}

@@ -52,14 +52,14 @@ struct Material {
     float unknown15;
     float unknown16;
     float unknown17;
-    float unknown18;
-    float unknown19;
-    float unknown20;
-    float unknown21;
-    float unknown22;
-    float unknown23;
-    float unknown24;
-    float unknown25;
+    uint unknown18;
+    uint unknown19;
+    uint unknown20;
+    uint unknown21;
+    uint unknown22;
+    uint unknown23;
+    uint unknown24;
+    uint unknown25;
 
     short albedoTextureIndex;
     short specularTextureIndex;
