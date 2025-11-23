@@ -361,6 +361,10 @@ Header ReadHeader(std::istream& stream) {
 
     Header h;
     h.Type = ReadUInt16s(stream, 1)[0];
+    if (h.Type != 0) {
+        std::ofstream(logPath.c_str(), std::ios::trunc) << "Unsupported BIKE format! expected 0.";
+        throw std::runtime_error("Unsupported BIKE format!");
+    }
     h.Unknown = ReadUInt16s(stream, 1)[0];
     h.Alignment = ReadUInt32s(stream, 1)[0];
     h.Padding = ReadUInt32s(stream, 1)[0];
@@ -706,31 +710,48 @@ int main(int argc, char* argv[])
     std::string filePathInput;
     std::string outDir;
     std::string txtFilePath;
+    bool presetFancy = true;
     bool mergeOn = false;
-
-    if (argc > 1) filePathInput = argv[1];
-
     bool outDirEmpty = true;
-    for (int i = 2; i < argc; i++) {
-        if (strcmp(argv[i], "m") == 0) {
-            mergeOn = true;
-        }
-        else {
-            // if multiple outDirs passed, last one wins
-            outDir = argv[i];
-			outDirEmpty = false;
-        }
-    }
-    if (outDir.empty() || !dirExists(outDir)) {
 
+    if (argc > 1)
+        filePathInput = argv[1];
+
+    for (int i = 2; i < argc; i++)
+    {
+        if (strcmp(argv[i], "m") == 0)
+        {
+            mergeOn = true;
+            continue;
+        }
+        if (strcmp(argv[i], "p") == 0)
+        {
+            presetFancy = false;
+            continue;
+        }
+        outDir = argv[i];
+        outDirEmpty = false;
+        // nuke quotes
+        outDir.erase(std::remove(outDir.begin(), outDir.end(), '"'), outDir.end());
+    }
+    // trim a trailing slash if present
+    if (!outDir.empty() &&
+        (outDir.back() == '\\' || outDir.back() == '/') &&
+        outDir.size() > 1)
+    {
+        outDir.pop_back();
+    }
+    // fallback to input file's parent if empty or invalid
+    if (outDir.empty() || !dirExists(outDir))
+    {
         size_t pos = filePathInput.find_last_of("/\\");
         outDir = (pos == std::string::npos) ? "." : filePathInput.substr(0, pos);
     }
-
     outDir = MakeAbsolutePath(outDir);
 
 	// debug default file path
-    //if (filePathInput.empty()) filePathInput = "./KP_L_R_area3.bin";
+    //mergeOn = true;
+    //if (filePathInput.empty()) filePathInput = "C:\\Users\\Blurro\\Downloads\\mkdx bin backup\\Data\\Model\\object\\FC_chara\\alien_gloup_A.bin";
     //if (filePathInput.empty()) filePathInput = "C:\\Users\\Blurro\\Downloads\\64646464.dae";
     //if (filePathInput.empty()) { filePathInput = "C:/Users/Blurro/source/repos/MKDXdaeconvert/x64/Debug/brian/briannn.dae"; arg2 = "C:/Users/Blurro/source/repos/MKDXdaeconvert/x64/Debug/brian/BrianPreset.txt"; }
 
@@ -774,7 +795,7 @@ int main(int argc, char* argv[])
 
             MKDXData data = LoadMKDXFile(fs);
 
-            SaveDaeFile(filePathInput, outDir, data.headerData, data.materialsData, data.textureNames, data.nodeLinks, data.allNodeNames, data.rootNodes, data.fullNodeDataList, mergeOn);
+            SaveDaeFile(filePathInput, outDir, data.headerData, data.materialsData, data.textureNames, data.nodeLinks, data.allNodeNames, data.rootNodes, data.fullNodeDataList, mergeOn, presetFancy);
             //SaveMKDXFile(filePathInput, data.headerData, data.materialsData, data.textureNames, data.boneNames, data.nodeLinks, data.allNodeNames, data.rootNodes, data.fullNodeDataList); // debug remake file
         }
 		else if (ext == ".mot")
@@ -800,11 +821,11 @@ int main(int argc, char* argv[])
 
                 size_t pos = filePathInput.find_last_of('.');
                 if (pos != std::string::npos)
-                    filePathInput = filePathInput.substr(0, pos) + ".dae";
+                    filePathInput = filePathInput.substr(0, pos) + "_tmp.dae";
 
-                std::string exePath = exeDir + "\\fbxtool\\FbxConverter.exe";
+                std::string exePath = exeDir + "\\FbxConverter.exe";
                 if (stat(exePath.c_str(), &buf) != 0) {
-                    std::ofstream(logPath.c_str(), std::ios::trunc) << "Error: /fbxtool/FbxConverter.exe doesnt exist, cant continue";
+                    std::ofstream(logPath.c_str(), std::ios::trunc) << "Error: FbxConverter.exe doesnt exist, cant continue";
                     exit(EXIT_FAILURE);
                 }
 
@@ -831,11 +852,11 @@ int main(int argc, char* argv[])
                         std::transform(lowerLine.begin(), lowerLine.end(), lowerLine.begin(), ::tolower);
                         if (lowerLine.find("<author>blender") != std::string::npos ||
                             lowerLine.find("<authoring_tool>blender") != std::string::npos ||
-                            lowerLine.find("<technique profile=\"blender\"") != std::string::npos)
+                            lowerLine.find("<technique profile=\"blender\"") != std::string::npos) {
                             std::cerr << "Error: Don't input a Blender exported collada, please use FBX!\n";
-                        std::ofstream(logPath.c_str(), std::ios::trunc) << "Error: Don't input a Blender exported collada, please use FBX!";
-                        exit(EXIT_FAILURE);
-                        break;
+                            std::ofstream(logPath.c_str(), std::ios::trunc) << "Error: Don't input a Blender exported collada, please use FBX!";
+                            exit(EXIT_FAILURE);
+                        }
                     }
                 }
                 in.close();
@@ -1048,21 +1069,25 @@ int main(int argc, char* argv[])
                 if (meshList.size() == 0) {
                     std::cerr << "no #Meshes block found\n";
                 }
-                int dummyMat = 0;
+                short dummyIndex = -1;
                 if (materials.size() == scene->mNumMaterials + 1) {
-                    const auto& first = materials[0];
-                    if (first.texAlbedo == -1 && first.texSpecular == -1 && first.texReflective == -1 &&
-                        first.texEnvironment == -1 && first.texNormal == -1) {
-                        dummyMat = 1;
-                        std::cout << "\nDetected and adding absent-from-dae dummy material from preset\n\n";
+                    for (int i = 0; i < materials.size(); i++) {
+                        const auto& m = materials[i];
+                        if (m.texAlbedo == -1 && m.texSpecular == -1 &&
+                            m.texReflective == -1 && m.texEnvironment == -1 &&
+                            m.texNormal == -1) {
+                            dummyIndex = i;
+                            std::cout << "\nDetected dummy material at index " << i << "\n\n";
+                            break;
+                        }
                     }
                 }
-                if (materials.size() != scene->mNumMaterials + dummyMat) {
+                size_t expected = scene->mNumMaterials + (dummyIndex != -1 ? 1 : 0);
+                if (materials.size() != expected) {
                     std::string errMsg = "Error: expected " + std::to_string(scene->mNumMaterials) +
                         " materials (+allowed 1 dummy), but loaded " + std::to_string(materials.size()) + " from preset\n";
                     std::cerr << errMsg;
                     std::ofstream(logPath.c_str(), std::ios::trunc) << errMsg;
-                    //system("pause");
                     return 1;
                 }
                 std::cout << "loaded " << materials.size() << " materials, " << textureNames.size() << " textures, and " << meshList.size() << " meshes" << "\n";
@@ -1368,7 +1393,9 @@ int main(int argc, char* argv[])
                             fullNode.subMeshes[s].BonesIndexMask = mask;
                             fullNode.subMeshes[s].SkinnedBonesCount = skinnedCount;
                             fullNode.subMeshes[s].TriangleCount = mesh->mNumFaces;
-                            fullNode.subMeshes[s].MaterialIndex = mesh->mMaterialIndex + dummyMat;
+                            short finalMat = mesh->mMaterialIndex;
+                            if (dummyIndex != -1 && finalMat >= dummyIndex) finalMat++;
+                            fullNode.subMeshes[s].MaterialIndex = finalMat;
                             fullNode.subMeshes[s].VertexCount = mesh->mNumVertices;
 
                             std::vector<float> verts, norms, cols, uv0, uv1, uv2, uv3;
@@ -1621,7 +1648,7 @@ int main(int argc, char* argv[])
                 check.close();
 
                 //std::cout << outDir << " is the output directory\n";
-                SaveMKDXFile(filePathInput, outDir, headerData, materialsData, textureNames, boneNames, nodeLinks, allNodeNames, rootNodes, fullNodeDataList);
+                SaveMKDXFile(filePathInput, outDir, headerData, materialsData, textureNames, boneNames, nodeLinks, allNodeNames, rootNodes, fullNodeDataList, ext == ".fbx");
                 std::remove(filePathInput.c_str()); // remove tmp file
             }
         }
@@ -1665,7 +1692,7 @@ int main(int argc, char* argv[])
                             try {
                                 MKDXData data = LoadMKDXFile(fs);
                                 SaveDaeFile(fullPath, outDir, data.headerData, data.materialsData, data.textureNames,
-                                    data.nodeLinks, data.allNodeNames, data.rootNodes, data.fullNodeDataList, mergeOn);
+                                    data.nodeLinks, data.allNodeNames, data.rootNodes, data.fullNodeDataList, mergeOn, presetFancy);
                                 converted++;
                             }
                             catch (const std::exception& e) {

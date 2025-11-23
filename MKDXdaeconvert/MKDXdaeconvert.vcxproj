@@ -139,6 +139,7 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="CoolStuff.cpp" />
+    <ClCompile Include="export_wrapper.c" />
     <ClCompile Include="SaveFuncs.cpp" />
   </ItemGroup>
   <ItemGroup>

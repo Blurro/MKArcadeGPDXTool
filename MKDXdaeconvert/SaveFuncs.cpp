@@ -15,8 +15,21 @@
 #include <regex>
 #include <assimp/DefaultLogger.hpp>
 #include <Windows.h>
+// to run assimp in new thread (to be able to rerun when it crashes)
+#include <thread>
+#include <chrono>
 
 #include "SaveFuncs.h"
+
+extern "C" int safe_export_call(int (*fn)(void*, const char*), void* scene, const char* outpath);
+
+// the actual exporter function called through the C wrapper
+// return 0 for success, 1 for normal export failure
+int my_exporter(void* s, const char* out) {
+    const aiScene* scene = static_cast<const aiScene*>(s);
+    Assimp::Exporter e;
+    return e.Export(scene, "collada", out) == aiReturn_SUCCESS ? 0 : 1;
+}
 
 aiNode* BuildAiNode(uint32_t index, const std::vector<NodeNames>& allNodeNames,
     const std::vector<FullNodeData>& fullNodeDataList,
@@ -157,7 +170,7 @@ bool vecEquals(const std::vector<float>& v, const float* def, size_t count, floa
 
 int WritePresetFile(const std::string& path, const std::vector<Material>& materialsData,
     const std::vector<TextureName>& textureNames, const std::vector<NodeNames>& allNodeNames,
-    const std::vector<FullNodeData>& fullNodeDataList)
+    const std::vector<FullNodeData>& fullNodeDataList, const bool presetFancy)
 {
     std::ofstream out(path);
     if (!out) {
@@ -316,7 +329,7 @@ std::string MakeOutFilePath(const std::string& path, const std::string& outDir)
 
 void SaveDaeFile(const std::string& path, const std::string& outDir, Header& headerData, std::vector<Material>& materialsData, std::vector<TextureName>& textureNames,
     std::vector<NodeLinks>& nodeLinks, std::vector<NodeNames>& allNodeNames,
-    std::vector<uint32_t>& rootNodes, std::vector<FullNodeData>& fullNodeDataList, const bool mergeSubmeshes)
+    std::vector<uint32_t>& rootNodes, std::vector<FullNodeData>& fullNodeDataList, const bool mergeSubmeshes, const bool presetFancy)
 {
     // rename children of root to remove the root name prefix
     for (auto root : rootNodes) {
@@ -549,9 +562,13 @@ void SaveDaeFile(const std::string& path, const std::string& outDir, Header& hea
             // apply uvs
             for (int uvIdx = 0; uvIdx < 4; uvIdx++) {
                 if (!mergedUVs[uvIdx].empty()) {
-                    mergedMesh->mTextureCoords[uvIdx] = new aiVector3D[mergedUVs[uvIdx].size()];
-                    std::copy(mergedUVs[uvIdx].begin(), mergedUVs[uvIdx].end(), mergedMesh->mTextureCoords[uvIdx]);
+                    mergedMesh->mTextureCoords[uvIdx] = new aiVector3D[mergedMesh->mNumVertices];
                     mergedMesh->mNumUVComponents[uvIdx] = 2;
+                    unsigned int copyCount = std::min<unsigned int>(mergedUVs[uvIdx].size(), mergedMesh->mNumVertices);
+                    for (unsigned int v = 0; v < copyCount; ++v)
+                        mergedMesh->mTextureCoords[uvIdx][v] = mergedUVs[uvIdx][v];
+                    for (unsigned int v = copyCount; v < mergedMesh->mNumVertices; ++v)
+                        mergedMesh->mTextureCoords[uvIdx][v] = aiVector3D(0.f, 0.f, 0.f);
                 }
             }
 
@@ -640,9 +657,13 @@ void SaveDaeFile(const std::string& path, const std::string& outDir, Header& hea
 
                 for (int uvIdx = 0; uvIdx < 4; uvIdx++) {
                     if (!uvs[uvIdx].empty()) {
-                        mesh->mTextureCoords[uvIdx] = new aiVector3D[uvs[uvIdx].size()];
-                        std::copy(uvs[uvIdx].begin(), uvs[uvIdx].end(), mesh->mTextureCoords[uvIdx]);
+                        mesh->mTextureCoords[uvIdx] = new aiVector3D[mesh->mNumVertices]; // allocate full vertex count
                         mesh->mNumUVComponents[uvIdx] = 2;
+                        unsigned int copyCount = std::min<unsigned int>(uvs[uvIdx].size(), mesh->mNumVertices);
+                        for (unsigned int v = 0; v < copyCount; ++v)
+                            mesh->mTextureCoords[uvIdx][v] = uvs[uvIdx][v]; // copy existing
+                        for (unsigned int v = copyCount; v < mesh->mNumVertices; ++v)
+                            mesh->mTextureCoords[uvIdx][v] = aiVector3D(0.f, 0.f, 0.f); // fallback
                     }
                 }
 
@@ -844,55 +865,90 @@ void SaveDaeFile(const std::string& path, const std::string& outDir, Header& hea
 
     std::cout << std::endl << "Writing preset..." << std::endl;
     // convoluted preset name script lol
-    std::string presetFilename = path.substr(path.find_last_of("/\\") + 1);
-    presetFilename = presetFilename.substr(0, presetFilename.find_last_of('.') == std::string::npos ? presetFilename.size() : presetFilename.find_last_of('.'));
-    presetFilename = presetFilename.substr(0, presetFilename.find_first_of(' ') == std::string::npos ? presetFilename.size() : presetFilename.find_first_of(' '));
-    std::string result;
-    bool capitalize = true;
-    for (char c : presetFilename) {
-        if (c == '_' || c == '-') { capitalize = true; continue; }
-        result += capitalize ? (char)toupper(c) : c;
-        capitalize = false;
+    std::string baseFilename = path.substr(path.find_last_of("/\\") + 1);
+    baseFilename = baseFilename.substr(0, baseFilename.find_last_of('.') == std::string::npos ? baseFilename.size() : baseFilename.find_last_of('.'));
+
+    std::string presetFilename;
+
+    if (presetFancy) {
+        std::string temp = baseFilename.substr(0, baseFilename.find_first_of(' ') == std::string::npos ? baseFilename.size() : baseFilename.find_first_of(' '));
+        std::string result;
+        bool capitalize = true;
+        for (char c : temp) {
+            if (c == '_' || c == '-') { capitalize = true; continue; }
+            result += capitalize ? (char)toupper(c) : c;
+            capitalize = false;
+        }
+        if (result.size() >= 5 && result.substr(result.size() - 5) == "Model")
+            result = result.substr(0, result.size() - 5);
+        presetFilename = result + "_Preset.txt";
     }
-    if (result.size() >= 5 && result.substr(result.size() - 5) == "Model") result = result.substr(0, result.size() - 5);
-    std::string presetPath = MakeOutFilePath(result + "_Preset.txt", outDir);
-    WritePresetFile(presetPath, materialsData, textureNames, allNodeNames, fullNodeDataList);
+    else {
+        // simple lowercase for boring not fancy
+        presetFilename = baseFilename + "_preset.txt";
+    }
+
+    std::string presetPath = MakeOutFilePath(presetFilename, outDir);
+    WritePresetFile(presetPath, materialsData, textureNames, allNodeNames, fullNodeDataList, presetFancy);
 
     std::cout << std::endl << "Writing collada .dae..." << std::endl;
 
     Assimp::Exporter exporter;
     std::string outFile = path.substr(0, path.find_last_of('.')) + "_out.dae";
     outFile = MakeOutFilePath(outFile, outDir);
-    aiReturn rc;
-    {
-        Assimp::Exporter exporter;
-        rc = exporter.Export(scene, "collada", outFile);
-    }
+	// run exporter in a loop using the c file to catch crashes
+    int wait = 1;
+    for (;;) {
+        
 
+
+        int rc = safe_export_call(my_exporter, const_cast<aiScene*>(scene), outFile.c_str());
+        if (rc == 0) break; // success
+        // rc == -1 => exporter crashed, SEH caught it
+        std::cout << "[Failed] waiting 1s before trying again";
+        if (wait == 9) std::cout << " (dayum assimp can be a pain, it'll work trust)";
+        std::cout << std::endl;
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+
+        if (wait < 30) wait++;
+
+        if (wait == 30 && presetFancy) {
+            std::cerr << "Tried and failed 30 times to convert file. Assimp lib can be buggy - please try again!" << std::endl;
+            std::ofstream(logPath.c_str(), std::ios::trunc) << "Error: Tried and failed 30 times to convert file. Assimp lib can be buggy - please try again!";
+            std::exit(EXIT_FAILURE);
+        }
+    }
     CallPatchDaeFileDLL(outFile, allMaterialToIndices);
     CallGetNormalsFromDLL(outFile);
     std::cout << std::endl << "Saved file as " << outFile << std::endl;
 
     // convert to fbx thanks autodesk for coming in clutch
     struct stat buf;
-    std::string exePath = exeDir + "\\fbxtool\\FbxConverter.exe";
+    std::string exePath = exeDir + "\\FbxConverter.exe";
     std::string fbxPath = outFile.substr(0, outFile.find_last_of('.')) + ".fbx";
     if (stat(exePath.c_str(), &buf) == 0) {
         std::string cmd = "\"" + exePath + "\" \"" + outFile + "\" \"" + fbxPath + "\"";
         cmd = "\"" + cmd + "\"";
-        //std::cout << "running command: " << cmd << std::endl;
         system(cmd.c_str());
     }
 
-	std::ofstream(logPath.c_str(), std::ios::trunc) << "Saved collada file to " << outFile << "\nAlong with Maya py script to import normals\n\nBlender users must open created FBX imported at scale 100\n\nCreated " << presetFilename + "Preset.txt" << " file for MKDX importing" << std::endl;
+	std::ofstream(logPath.c_str(), std::ios::trunc) << "Saved collada file to " << outFile << "\nAlong with Maya py script to import normals\n\nBlender users must open created FBX imported at scale 100\n\nCreated " << presetFilename << " file for MKDX importing" << std::endl;
 }
 
 void SaveMKDXFile(const std::string& path, const std::string& outDir, Header& header, std::vector<Material>& materialsData,
     std::vector<TextureName>& textureNames, std::vector<NodeNames>& boneNames,
     std::vector<NodeLinks>& nodeLinks, std::vector<NodeNames>& allNodeNames,
-    std::vector<uint32_t>& rootNodes, std::vector<FullNodeData>& fullNodeDataList)
+    std::vector<uint32_t>& rootNodes, std::vector<FullNodeData>& fullNodeDataList, const bool isFBX)
 {
-    std::string outFile = path.substr(0, path.find_last_of('.')) + "_out.bin";
+    std::string outFile = path.substr(0, path.find_last_of('.')); // strip original extension
+    if (isFBX) {
+        const std::string tmpSuffix = "_tmp";
+        if (outFile.size() >= tmpSuffix.size() &&
+            outFile.compare(outFile.size() - tmpSuffix.size(), tmpSuffix.size(), tmpSuffix) == 0) {
+            outFile.resize(outFile.size() - tmpSuffix.size()); // remove "_tmp"
+        }
+    }
+    outFile += "_out.bin";
     outFile = MakeOutFilePath(outFile, outDir);
     std::ofstream writer(outFile, std::ios::binary);
 
