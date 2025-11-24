@@ -19,14 +19,22 @@ I'm antsy waiting for the Switch 2 to be hacked so that I can dive right into ma
 - Right click 'Browse' to choose a folder to convert all files in - you can drag & drop a folder too
 - Leave the 'merge' option on Yes, unless you want the game's randomly split models as they are in the files.
 - Place extracted files next to textures. Maya can load .dae and .fbx, but **Blender users must only use .FBX!**
-- For cleanest rip, load .dae in Maya and paste the _normals.txt script into Maya's built-in Python interface
+<details>
+  <summary>Expand for MKDXTool.exe command line args</summary>
+  
+  *Any of these can be added after specifying the .bin file to extract from:*
+  
+  - 'm' will enable merging submeshes to full meshes (GUI has this enabled by default)
+  - 'p' will turn off the fancy preset name (BabyMario_Preset.txt -> baby_mario_model_preset.txt)
+  - 'n' will enable extracting vertex normals data to create a Maya py script. Good if opening .dae in Maya skips normals, but this appears to be redundant lol
+</details>
 
 ***Importing***
 - Modify an existing .dae/.fbx export in Maya or .fbx in Blender and modify it. **When loading FBX in Blender, set scale to 100**
 - All OG bones must exist but this may change once animations can be replaced
 - Have either everything inside Armature, or everything outside Armature + Armature deleted.
 - Maya imports will turn '.' into 'FBXASC045', don't change this, the tool will still recognise this as a period upon reimport
-- **Blender users must only export .FBX - remember to disable leaf bones!** hit Browse or drag and drop your new .dae/.fbx into the input box
+- **Blender users must only export .FBX - remember to disable leaf bones!** Hit Browse or drag and drop your new .dae/.fbx into the input box
 - Modify the (character)_Preset.txt file to add/modify materials etc, then hit Browse or drag and drop it onto the bottom input box
 
 
